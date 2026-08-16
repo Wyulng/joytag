@@ -1,0 +1,1033 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Joytag 管理</title>
+  <style>
+    /* 工程风格极简样式：系统字体、1px 实线边框、无圆角/阴影/渐变 */
+    * { box-sizing: border-box; }
+    body { margin: 0; font-family: -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif; font-size: 14px; color: #222; background: #fff; }
+    .nav { display: flex; flex-wrap: wrap; padding: 0 12px; background: #fafafa; border-bottom: 1px solid #ccc; }
+    .nav a { display: inline-block; padding: 10px 12px; color: #222; text-decoration: none; border-bottom: 2px solid transparent; }
+    .nav a.brand { font-weight: bold; border-right: 1px solid #ccc; }
+    .nav a:not(.brand):hover { background: #eee; }
+    .nav a.active { border-bottom-color: #222; font-weight: bold; }
+    .container { max-width: 1240px; margin: 0 auto; padding: 16px; }
+    h1 { font-size: 18px; margin: 0 0 4px; }
+    h2 { font-size: 15px; margin: 14px 0 6px; }
+    .sub { color: #666; font-size: 12px; margin: 0 0 12px; }
+    .toolbar { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin: 8px 0; }
+    .field-label { color: #666; font-size: 12px; }
+    .spacer { flex: 1; }
+    table { border-collapse: collapse; width: 100%; margin: 8px 0; }
+    th, td { border: 1px solid #ccc; padding: 6px 8px; text-align: left; font-size: 13px; vertical-align: top; }
+    th { background: #f5f5f5; font-size: 12px; color: #555; white-space: nowrap; }
+    td .reason { max-width: 320px; word-break: break-word; }
+    .muted { color: #888; }
+    .empty-row td { text-align: center; color: #888; padding: 16px; }
+    input, select { border: 1px solid #ccc; padding: 4px 6px; font-size: 13px; background: #fff; }
+    button { border: 1px solid #333; background: #fff; color: #222; padding: 5px 12px; font-size: 13px; cursor: pointer; }
+    button:hover:not(:disabled) { background: #f0f0f0; }
+    button:disabled { opacity: .5; cursor: not-allowed; }
+    .btn-sm { padding: 2px 8px; font-size: 12px; }
+    .btn-primary { background: #1a3c6e; border-color: #1a3c6e; color: #fff; }
+    .btn-primary:hover:not(:disabled) { background: #26497f; }
+    .btn-danger { color: #a00; border-color: #a00; }
+    .btn-danger:hover:not(:disabled) { background: #fdf0f0; }
+    .badge { display: inline-block; border: 1px solid #999; color: #555; font-size: 11px; padding: 0 6px; }
+    .badge.ok { border-color: #187; color: #187; }
+    .badge.warn { border-color: #a60; color: #a60; }
+    .badge.bad { border-color: #a00; color: #a00; }
+    .badge.info { border-color: #36c; color: #36c; }
+    .pager { display: flex; align-items: center; gap: 8px; margin: 8px 0; }
+    .page-info { font-size: 12px; color: #666; }
+    .stats { display: flex; gap: 12px; flex-wrap: wrap; }
+    .stat { border: 1px solid #ccc; padding: 12px 20px; min-width: 120px; }
+    .stat .num { font-size: 22px; }
+    .stat .label { font-size: 12px; color: #666; }
+    .toast { position: fixed; top: 12px; right: 12px; border: 1px solid #187; color: #187; background: #fff; padding: 8px 14px; font-size: 13px; z-index: 999; opacity: 0; transition: opacity .2s; }
+    .toast.show { opacity: 1; }
+    .toast.err { border-color: #a00; color: #a00; }
+    .rule-grid { display: flex; gap: 24px; flex-wrap: wrap; }
+    .rule-grid > div { flex: 1; min-width: 280px; }
+    .rule-list { border: 1px solid #ccc; margin-top: 6px; max-height: 480px; overflow: auto; }
+    .rule-item { display: flex; align-items: center; gap: 8px; padding: 4px 8px; border-bottom: 1px solid #eee; font-size: 13px; }
+    .rule-item:last-child { border-bottom: none; }
+    .rule-item .del { margin-left: auto; }
+    .rule-id { font-size: 11px; color: #888; border: 1px solid #ddd; padding: 0 4px; }
+    .rule-by { font-size: 11px; }
+    code { font-size: 12px; background: #f5f5f5; padding: 1px 4px; border: 1px solid #eee; }
+    pre { border: 1px solid #ccc; padding: 8px; background: #fafafa; font-size: 12px; overflow: auto; max-height: 400px; }
+    .cat-input { width: 90px; }
+  </style>
+</head>
+<body>
+  <nav id="nav" class="nav"></nav>
+  <main class="container">
+
+    <section id="tab-overview" hidden>
+      <h1>概览</h1>
+      <p class="sub" id="ov-sub"></p>
+      <div class="stats" id="ov-stats">
+        <div class="stat"><div class="num">–</div><div class="label">加载中…</div></div>
+      </div>
+    </section>
+
+    <section id="tab-pending" hidden>
+      <h1>待审核队列 <span class="badge warn" id="pd-count-badge">–</span></h1>
+      <p class="sub">LLM 判定存疑的词条，人工通过后写入词库 / 拒绝后加入该国禁用词</p>
+      <div class="toolbar">
+        <span class="field-label">国家</span>
+        <select id="pd-country"></select>
+        <span class="spacer"></span>
+        <button id="pd-refresh">刷新</button>
+      </div>
+      <div style="overflow-x:auto">
+        <table>
+          <thead>
+            <tr>
+              <th>词汇</th><th>国家</th><th>类目</th><th>中文原文</th><th>来源</th><th>存疑理由</th><th>时间</th><th>操作</th>
+            </tr>
+          </thead>
+          <tbody id="pd-tbody"></tbody>
+        </table>
+      </div>
+      <div class="pager">
+        <button class="btn-sm" id="pd-prev" disabled>上一页</button>
+        <span class="page-info" id="pd-page-info"></span>
+        <button class="btn-sm" id="pd-next" disabled>下一页</button>
+      </div>
+    </section>
+
+    <section id="tab-tags" hidden>
+      <h1>标签库</h1>
+      <p class="sub" id="tg-sub"></p>
+      <div class="toolbar">
+        <span class="field-label">搜索</span>
+        <input id="tg-search" placeholder="输入关键词…" style="width:200px">
+        <span class="field-label">国家</span>
+        <select id="tg-country"></select>
+        <span class="field-label">类目</span>
+        <input id="tg-category" placeholder="如：服装" style="width:120px">
+        <span class="spacer"></span>
+        <button id="tg-refresh">刷新</button>
+      </div>
+      <div style="overflow-x:auto">
+        <table>
+          <thead>
+            <tr>
+              <th>词汇</th><th>国家</th><th>类目</th><th>合规状态</th><th>理由</th><th>来源</th><th>热度</th><th>时间</th><th>操作</th>
+            </tr>
+          </thead>
+          <tbody id="tg-tbody"></tbody>
+        </table>
+      </div>
+      <div class="pager">
+        <button class="btn-sm" id="tg-prev" disabled>上一页</button>
+        <span class="page-info" id="tg-page-info"></span>
+        <button class="btn-sm" id="tg-next" disabled>下一页</button>
+      </div>
+    </section>
+
+    <section id="tab-collect" hidden>
+      <h1>采集管理</h1>
+      <p class="sub">手动触发采集 + 定时任务（Cron）管理。采集耗时数分钟，请勿重复触发</p>
+      <h2>手动采集</h2>
+      <div class="toolbar">
+        <button class="btn-primary" id="cl-btn-overseas">触发海外采集</button>
+        <button class="btn-primary" id="cl-btn-cn">触发中文采集</button>
+        <span id="cl-collect-result" class="muted"></span>
+      </div>
+      <h2>定时任务</h2>
+      <div class="toolbar">
+        <span class="field-label">名称</span>
+        <input id="cl-new-name" placeholder="任务名称" style="width:140px">
+        <span class="field-label">类型</span>
+        <select id="cl-new-type">
+          <option value="overseas">海外采集</option>
+          <option value="cn">中文采集</option>
+        </select>
+        <span class="field-label">Cron</span>
+        <input id="cl-new-cron" placeholder="分 时 日 月 周，如 */30 * * * *" style="width:200px">
+        <button class="btn-primary" id="cl-btn-create">新建</button>
+        <span class="spacer"></span>
+        <button id="cl-btn-reload">刷新</button>
+      </div>
+      <table>
+        <thead>
+          <tr>
+            <th>名称</th><th>类型</th><th>Cron</th><th>状态</th><th>上次运行</th><th>操作</th>
+          </tr>
+        </thead>
+        <tbody id="cl-tbody"></tbody>
+      </table>
+    </section>
+
+    <section id="tab-rules" hidden>
+      <h1>规则管理</h1>
+      <p class="sub">各国禁用词（硬拦截）与安全词（跳过 LLM 直接通过）</p>
+      <div class="toolbar">
+        <span class="field-label">国家</span>
+        <select id="rl-country"></select>
+      </div>
+      <div class="rule-grid">
+        <div>
+          <h2>禁用词 <span id="rl-banned-count" class="muted"></span></h2>
+          <div class="toolbar">
+            <input id="rl-banned-input" placeholder="添加禁用词" style="flex:1">
+            <button class="btn-sm btn-danger" id="rl-banned-add">添加</button>
+          </div>
+          <div class="rule-list" id="rl-banned-list"></div>
+        </div>
+        <div>
+          <h2>安全词 <span id="rl-safe-count" class="muted"></span></h2>
+          <div class="toolbar">
+            <input id="rl-safe-input" placeholder="添加安全词" style="flex:1">
+            <button class="btn-sm btn-primary" id="rl-safe-add">添加</button>
+          </div>
+          <div class="rule-list" id="rl-safe-list"></div>
+        </div>
+      </div>
+    </section>
+
+    <section id="tab-anchors" hidden>
+      <h1>中文锚点库</h1>
+      <p class="sub" id="an-sub">海外趋势词翻译后匹配的中文语义锚点</p>
+      <div class="toolbar">
+        <span class="field-label">搜索</span>
+        <input id="an-search" placeholder="输入中文词…" style="width:200px">
+        <span class="field-label">类目</span>
+        <input id="an-category" placeholder="如：服装" style="width:120px">
+        <span class="spacer"></span>
+        <button id="an-refresh">刷新</button>
+      </div>
+      <div style="overflow-x:auto">
+        <table>
+          <thead>
+            <tr>
+              <th>锚点词</th><th>类目</th><th>关联标签数</th><th>创建时间</th><th>操作</th>
+            </tr>
+          </thead>
+          <tbody id="an-tbody"></tbody>
+        </table>
+      </div>
+      <div class="pager">
+        <button class="btn-sm" id="an-prev" disabled>上一页</button>
+        <span class="page-info" id="an-page-info"></span>
+        <button class="btn-sm" id="an-next" disabled>下一页</button>
+      </div>
+    </section>
+
+    <section id="tab-blocked" hidden>
+      <h1>拦截记录</h1>
+      <p class="sub" id="bk-sub">被合规规则/LLM 判定「需拦截」的词条决策留痕（UCPD/GDPR 举证），删除需 admin 角色</p>
+      <div class="toolbar">
+        <span class="field-label">国家</span>
+        <select id="bk-country"></select>
+        <span class="spacer"></span>
+        <button id="bk-refresh">刷新</button>
+      </div>
+      <div style="overflow-x:auto">
+        <table>
+          <thead>
+            <tr>
+              <th>词汇</th><th>国家</th><th>类别</th><th>拦截理由</th><th>规则ID</th><th>来源</th><th>时间</th><th>操作</th>
+            </tr>
+          </thead>
+          <tbody id="bk-tbody"></tbody>
+        </table>
+      </div>
+      <div class="pager">
+        <button class="btn-sm" id="bk-prev" disabled>上一页</button>
+        <span class="page-info" id="bk-page-info"></span>
+        <button class="btn-sm" id="bk-next" disabled>下一页</button>
+      </div>
+    </section>
+
+    <section id="tab-audit" hidden>
+      <h1>审计日志</h1>
+      <p class="sub" id="au-sub">全部管理变更操作的 hash-chain 审计（GDPR Art.5(2) 可责性），仅 admin 可见</p>
+      <div class="toolbar">
+        <span class="field-label">操作</span>
+        <select id="au-action">
+          <option value="">全部</option>
+          <option value="pending.approve">pending.approve</option>
+          <option value="pending.reject">pending.reject</option>
+          <option value="tag.delete">tag.delete</option>
+          <option value="anchor.delete">anchor.delete</option>
+          <option value="rule.add_banned">rule.add_banned</option>
+          <option value="rule.remove_banned">rule.remove_banned</option>
+          <option value="rule.add_safe">rule.add_safe</option>
+          <option value="rule.remove_safe">rule.remove_safe</option>
+          <option value="blocked.delete">blocked.delete</option>
+          <option value="collect.overseas">collect.overseas</option>
+          <option value="collect.cn">collect.cn</option>
+          <option value="schedule.create">schedule.create</option>
+          <option value="schedule.update">schedule.update</option>
+          <option value="schedule.delete">schedule.delete</option>
+          <option value="schedule.run">schedule.run</option>
+        </select>
+        <span class="spacer"></span>
+        <button class="btn-danger" id="au-verify">校验哈希链</button>
+        <button id="au-refresh">刷新</button>
+      </div>
+      <div style="overflow-x:auto">
+        <table>
+          <thead>
+            <tr>
+              <th>ID</th><th>时间</th><th>操作者</th><th>角色</th><th>操作</th><th>资源</th><th>快照/详情</th>
+            </tr>
+          </thead>
+          <tbody id="au-tbody"></tbody>
+        </table>
+      </div>
+      <div class="pager">
+        <button class="btn-sm" id="au-prev" disabled>上一页</button>
+        <span class="page-info" id="au-page-info"></span>
+        <button class="btn-sm" id="au-next" disabled>下一页</button>
+      </div>
+    </section>
+
+    <section id="tab-dsar" hidden>
+      <h1>DSAR 工单</h1>
+      <p class="sub" id="ds-sub">GDPR Art.15 访问权 / Art.17 删除权 / Art.21 反对权——公开受理入口为 <code>/v1/dsar/request</code>（5 次/小时限流），30 天内响应（Art.12(3)）</p>
+      <div class="toolbar">
+        <span class="field-label">状态</span>
+        <select id="ds-status">
+          <option value="">全部</option>
+          <option value="received">received</option>
+          <option value="in_progress">in_progress</option>
+          <option value="completed">completed</option>
+          <option value="rejected">rejected</option>
+        </select>
+        <span class="spacer"></span>
+        <button id="ds-refresh">刷新</button>
+      </div>
+      <div style="overflow-x:auto">
+        <table>
+          <thead>
+            <tr>
+              <th>工单号</th><th>时间</th><th>类型</th><th>状态</th><th>联系方式</th><th>说明</th><th>操作</th>
+            </tr>
+          </thead>
+          <tbody id="ds-tbody"></tbody>
+        </table>
+      </div>
+      <div class="pager">
+        <button class="btn-sm" id="ds-prev" disabled>上一页</button>
+        <span class="page-info" id="ds-page-info"></span>
+        <button class="btn-sm" id="ds-next" disabled>下一页</button>
+      </div>
+
+      <div id="ds-detail-card" style="display:none">
+        <h2>工单详情</h2>
+        <pre id="ds-detail"></pre>
+        <div class="toolbar">
+          <span class="field-label">词条</span>
+          <input id="ds-term" placeholder="检索/擦除的词条（精确匹配）" style="width:260px">
+          <button id="ds-search-btn">跨库检索</button>
+          <button class="btn-danger" id="ds-erase-btn">执行擦除（不可逆）</button>
+        </div>
+      </div>
+    </section>
+
+  </main>
+
+  <script src="/static/js/admin.js"></script>
+  <script>
+    /* ===== tab 路由：hash 定位 + 懒加载（DOM 常驻，切 tab 保留筛选/分页状态） ===== */
+    /* TAB_ORDER 单一来源在 admin.js（renderTabs 导航同用）；新增 tab 只改 admin.js
+       并在下方注册 TABS[id] = { init } */
+    const TABS = {};
+
+    function currentHash() {
+      const h = location.hash.replace('#', '');
+      return TAB_ORDER.indexOf(h) >= 0 ? h : 'overview';
+    }
+
+    function activateTab(name) {
+      TAB_ORDER.forEach(n => { document.getElementById('tab-' + n).hidden = (n !== name); });
+      renderTabs(name);
+      if (!TABS[name].loaded) {
+        TABS[name].loaded = true;
+        TABS[name].init();
+      }
+    }
+    window.addEventListener('hashchange', () => activateTab(currentHash()));
+
+    /* 表格空态：403（RBAC 无权限）渲染"无权限"行并静默；其余错误继续抛出交给 toast */
+    function permissionEmpty(tbody, colspan, err) {
+      if (err && err.status === 403) {
+        tbody.innerHTML = `<tr class="empty-row"><td colspan="${colspan}">无权限（仅 admin 角色）</td></tr>`;
+        return true;
+      }
+      return false;
+    }
+
+    /* ===== 概览 ===== */
+    (function () {
+      TABS.overview = {
+        init: function () {
+          load();
+          setInterval(() => { if (!document.getElementById('tab-overview').hidden) load(); }, 30000);
+        },
+      };
+      async function load() {
+        try {
+          const s = await api('/admin/api/stats');
+          const cards = [
+            { key: 'total_tags', label: '词库总量', fmt: n => n.toLocaleString() },
+            { key: 'total_pending', label: '待审核', fmt: n => n.toLocaleString() },
+            { key: 'total_anchors', label: '锚点词', fmt: n => n.toLocaleString() },
+            { key: 'distinct_countries', label: '覆盖国家', fmt: n => String(n) },
+            { key: 'compliance_rate', label: '合规率', fmt: n => (n * 100).toFixed(1) + '%' },
+          ];
+          document.getElementById('ov-stats').innerHTML = cards.map(c =>
+            `<div class="stat"><div class="num">${c.fmt(s[c.key] || 0)}</div><div class="label">${c.label}</div></div>`
+          ).join('');
+          document.getElementById('ov-sub').textContent = '数据每 30 秒自动刷新';
+        } catch (e) {
+          toast(e.message, false);
+        }
+      }
+    })();
+
+    /* ===== 待审核 ===== */
+    (function () {
+      TABS.pending = { init: init };
+      function init() {
+        const sel = document.getElementById('pd-country');
+        sel.innerHTML = countryOptions('');
+        sel.addEventListener('change', () => pager.goFirst().catch(e => toast(e.message, false)));
+
+        let nextOffset = null;
+        const pager = createPager(loadPage);
+
+        async function loadPage(cursor) {
+          const q = new URLSearchParams({ limit: '50' });
+          if (sel.value) q.set('country', sel.value);
+          if (cursor) q.set('cursor', cursor);
+          const data = await api('/admin/api/pending?' + q.toString());
+          nextOffset = data.next_offset;
+          renderRows(data.items);
+          document.getElementById('pd-next').disabled = (nextOffset === null || nextOffset === undefined);
+          document.getElementById('pd-prev').disabled = !pager.canPrev();
+          document.getElementById('pd-page-info').textContent =
+            `第 ${pager.page()} 页 · 本页 ${data.count} 条 · 共 ${data.total_count} 条`;
+        }
+
+        function renderRows(items) {
+          const tbody = document.getElementById('pd-tbody');
+          if (!items.length) {
+            tbody.innerHTML = '<tr class="empty-row"><td colspan="8">暂无待审核词条</td></tr>';
+            return;
+          }
+          tbody.innerHTML = items.map(it => `
+            <tr data-id="${esc(it.id)}">
+              <td><strong>${esc(it.word)}</strong></td>
+              <td><span class="badge info">${esc(it.country)}</span></td>
+              <td>${esc(it.category || '–')}</td>
+              <td>${esc(it.cn_original || '–')}</td>
+              <td class="muted">${esc(it.source)}</td>
+              <td><div class="reason">${esc(it.assessment_reason)}</div></td>
+              <td class="muted">${esc((it.created_at || '').replace('T', ' ').slice(0, 19))}</td>
+              <td style="white-space:nowrap">
+                <input class="cat-input" placeholder="类目(可选)">
+                <button class="btn-sm btn-primary approve">通过</button>
+                <button class="btn-sm btn-danger reject">拒绝</button>
+              </td>
+            </tr>`).join('');
+
+          tbody.querySelectorAll('tr[data-id]').forEach(tr => {
+            const id = tr.dataset.id;
+            tr.querySelector('.approve').addEventListener('click', withLoading(tr.querySelector('.approve'), async () => {
+              const cat = tr.querySelector('.cat-input').value.trim();
+              const res = await api(`/admin/api/pending/${encodeURIComponent(id)}/approve`, {
+                method: 'POST', body: { category: cat || null },
+              });
+              toast(res.message);
+              await reload();
+            }));
+            tr.querySelector('.reject').addEventListener('click', withLoading(tr.querySelector('.reject'), async () => {
+              const word = tr.querySelector('td strong').textContent;
+              if (!confirm(`确定拒绝「${word}」？该词将加入该国禁用词列表。`)) return;
+              const reason = prompt('请输入拒绝理由（必填，将写入审计记录与规则库）：');
+              if (!reason || !reason.trim()) return;
+              const res = await api(`/admin/api/pending/${encodeURIComponent(id)}/reject`, {
+                method: 'POST', body: { reason: reason.trim() },
+              });
+              toast(res.message);
+              await reload();
+            }));
+          });
+        }
+
+        async function reload() {
+          await Promise.all([pager.goFirst(), loadCount()]);
+        }
+        async function loadCount() {
+          const data = await api('/admin/api/pending/count');
+          document.getElementById('pd-count-badge').textContent = data.count;
+        }
+        document.getElementById('pd-prev').addEventListener('click', () => pager.prev().catch(e => toast(e.message, false)));
+        document.getElementById('pd-next').addEventListener('click', () => pager.next(nextOffset).catch(e => toast(e.message, false)));
+        document.getElementById('pd-refresh').addEventListener('click', () => pager.goFirst().catch(e => toast(e.message, false)));
+
+        reload().catch(e => toast(e.message, false));
+      }
+    })();
+
+    /* ===== 标签库 ===== */
+    (function () {
+      TABS.tags = { init: init };
+      function init() {
+        const sel = document.getElementById('tg-country');
+        sel.innerHTML = countryOptions('');
+        sel.addEventListener('change', () => pager.goFirst().catch(e => toast(e.message, false)));
+        document.getElementById('tg-category').addEventListener('change', () => pager.goFirst().catch(e => toast(e.message, false)));
+
+        let searchTimer = null;
+        document.getElementById('tg-search').addEventListener('input', function () {
+          clearTimeout(searchTimer);
+          searchTimer = setTimeout(() => pager.goFirst().catch(e => toast(e.message, false)), 300);
+        });
+
+        let nextOffset = null;
+        const pager = createPager(loadPage);
+
+        async function loadPage(cursor) {
+          const q = new URLSearchParams({ limit: '20' });
+          if (document.getElementById('tg-search').value.trim()) q.set('search', document.getElementById('tg-search').value.trim());
+          if (sel.value) q.set('country', sel.value);
+          if (document.getElementById('tg-category').value.trim()) q.set('category', document.getElementById('tg-category').value.trim());
+          if (cursor) q.set('cursor', cursor);
+          const data = await api('/admin/api/tags?' + q.toString());
+          nextOffset = data.next_offset;
+          renderRows(data.items);
+          document.getElementById('tg-sub').textContent = `共 ${data.total_count} 个标签`;
+          document.getElementById('tg-next').disabled = (nextOffset === null || nextOffset === undefined);
+          document.getElementById('tg-prev').disabled = !pager.canPrev();
+          document.getElementById('tg-page-info').textContent =
+            `第 ${pager.page()} 页 · 本页 ${data.count} 条`;
+        }
+
+        function renderRows(items) {
+          const tbody = document.getElementById('tg-tbody');
+          if (!items.length) {
+            tbody.innerHTML = '<tr class="empty-row"><td colspan="9">没有符合条件的标签</td></tr>';
+            return;
+          }
+          tbody.innerHTML = items.map(it => `
+            <tr data-id="${esc(it.id)}">
+              <td><strong>${esc(it.word)}</strong></td>
+              <td><span class="badge info">${esc(it.country)}</span></td>
+              <td>${esc(it.category || '–')}</td>
+              <td><span class="badge ${it.compliance_status === '可复用' ? 'ok' : 'warn'}">${esc(it.compliance_status)}</span></td>
+              <td><div class="reason">${esc(it.reason || '')}</div></td>
+              <td class="muted">${esc(it.source)}</td>
+              <td>${it.trend_score != null ? Number(it.trend_score).toFixed(2) : '–'}</td>
+              <td class="muted">${esc((it.created_at || '').replace('T', ' ').slice(0, 19))}</td>
+              <td><button class="btn-sm btn-danger del">删除</button></td>
+            </tr>`).join('');
+
+          tbody.querySelectorAll('tr[data-id]').forEach(tr => {
+            tr.querySelector('.del').addEventListener('click', withLoading(tr.querySelector('.del'), async () => {
+              const word = tr.querySelector('td strong').textContent;
+              if (!confirm(`确定删除标签「${word}」？`)) return;
+              const res = await api(`/admin/api/tags/${encodeURIComponent(tr.dataset.id)}`, { method: 'DELETE' });
+              toast(res.message);
+              await pager.goFirst();
+            }));
+          });
+        }
+
+        document.getElementById('tg-prev').addEventListener('click', () => pager.prev().catch(e => toast(e.message, false)));
+        document.getElementById('tg-next').addEventListener('click', () => pager.next(nextOffset).catch(e => toast(e.message, false)));
+        document.getElementById('tg-refresh').addEventListener('click', () => pager.goFirst().catch(e => toast(e.message, false)));
+
+        pager.goFirst().catch(e => toast(e.message, false));
+      }
+    })();
+
+    /* ===== 采集 ===== */
+    (function () {
+      TABS.collect = { init: init };
+      function init() {
+        const TYPE_LABEL = { cn: '中文采集', overseas: '海外采集' };
+
+        // ===== 手动采集 =====
+        document.getElementById('cl-btn-overseas').addEventListener('click', function () {
+          triggerCollect('overseas', this);
+        });
+        document.getElementById('cl-btn-cn').addEventListener('click', function () {
+          triggerCollect('cn', this);
+        });
+
+        async function triggerCollect(type, btn) {
+          const other = btn.id === 'cl-btn-overseas'
+            ? document.getElementById('cl-btn-cn') : document.getElementById('cl-btn-overseas');
+          btn.disabled = true; other.disabled = true;
+          const resultEl = document.getElementById('cl-collect-result');
+          resultEl.textContent = type === 'overseas' ? '海外采集中，预计数分钟…' : '中文采集中，预计数分钟…';
+          try {
+            const res = await api(`/admin/api/collect/${type}`, { method: 'POST' });
+            const summary = Object.entries(res)
+              .filter(([k]) => k !== 'status' && k !== 'message')
+              .map(([k, v]) => `${k}=${v}`).join(', ');
+            resultEl.textContent = `完成：${res.message}` + (summary ? `（${summary}）` : '');
+            toast(res.message);
+          } catch (e) {
+            resultEl.textContent = '失败：' + e.message;
+            toast(e.message, false);
+          } finally {
+            btn.disabled = false; other.disabled = false;
+          }
+        }
+
+        // ===== 定时任务 =====
+        function loadSchedules() {
+          api('/admin/api/schedules').then(data => {
+            const items = data.schedules || [];
+            const tbody = document.getElementById('cl-tbody');
+            if (!items.length) {
+              tbody.innerHTML = '<tr class="empty-row"><td colspan="6">暂无定时任务</td></tr>';
+              return;
+            }
+            tbody.innerHTML = items.map(s => `
+              <tr data-id="${esc(s.id)}">
+                <td><strong>${esc(s.name)}</strong></td>
+                <td>${esc(TYPE_LABEL[s.task_type] || s.task_type)}</td>
+                <td><code>${esc(s.cron)}</code></td>
+                <td><span class="badge ${s.enabled ? 'ok' : 'bad'}">${s.enabled ? '启用' : '停用'}</span></td>
+                <td class="muted">${esc(s.last_run ? s.last_run.replace('T', ' ').slice(0, 19) : '–')}</td>
+                <td style="white-space:nowrap">
+                  <button class="btn-sm run">立即运行</button>
+                  <button class="btn-sm toggle">${s.enabled ? '停用' : '启用'}</button>
+                  <button class="btn-sm edit">改Cron</button>
+                  <button class="btn-sm btn-danger del">删除</button>
+                </td>
+              </tr>`).join('');
+
+            tbody.querySelectorAll('tr[data-id]').forEach(tr => {
+              const id = tr.dataset.id;
+              tr.querySelector('.run').addEventListener('click', withLoading(tr.querySelector('.run'), async () => {
+                const res = await api(`/admin/api/schedules/${encodeURIComponent(id)}/run`, { method: 'POST' });
+                toast(res.message || '任务已触发');
+              }));
+              tr.querySelector('.toggle').addEventListener('click', withLoading(tr.querySelector('.toggle'), async () => {
+                const enabled = tr.querySelector('.badge').textContent === '停用';
+                await api(`/admin/api/schedules/${encodeURIComponent(id)}`, { method: 'PATCH', body: { enabled } });
+                toast(enabled ? '已启用' : '已停用');
+                loadSchedules();
+              }));
+              tr.querySelector('.edit').addEventListener('click', withLoading(tr.querySelector('.edit'), async () => {
+                const cron = prompt('新的 Cron 表达式（分 时 日 月 周）：', tr.querySelector('code').textContent);
+                if (cron === null) return;
+                await api(`/admin/api/schedules/${encodeURIComponent(id)}`, { method: 'PATCH', body: { cron: cron.trim() } });
+                toast('Cron 已更新');
+                loadSchedules();
+              }));
+              tr.querySelector('.del').addEventListener('click', withLoading(tr.querySelector('.del'), async () => {
+                if (!confirm(`确定删除任务「${tr.querySelector('td strong').textContent}」？`)) return;
+                await api(`/admin/api/schedules/${encodeURIComponent(id)}`, { method: 'DELETE' });
+                toast('任务已删除');
+                loadSchedules();
+              }));
+            });
+          }).catch(e => toast(e.message, false));
+        }
+
+        document.getElementById('cl-btn-create').addEventListener('click', withLoading(document.getElementById('cl-btn-create'), async () => {
+          const name = document.getElementById('cl-new-name').value.trim();
+          const cron = document.getElementById('cl-new-cron').value.trim();
+          if (!name || !cron) { toast('请填写名称和 Cron 表达式', false); return; }
+          await api('/admin/api/schedules', {
+            method: 'POST',
+            body: { name, task_type: document.getElementById('cl-new-type').value, cron },
+          });
+          toast('任务已创建');
+          document.getElementById('cl-new-name').value = '';
+          document.getElementById('cl-new-cron').value = '';
+          loadSchedules();
+        }));
+        document.getElementById('cl-btn-reload').addEventListener('click', loadSchedules);
+
+        loadSchedules();
+      }
+    })();
+
+    /* ===== 规则 ===== */
+    (function () {
+      TABS.rules = { init: init };
+      function init() {
+        const sel = document.getElementById('rl-country');
+        sel.innerHTML = countryOptions('DE');
+        sel.value = 'DE';
+        sel.addEventListener('change', loadRules);
+
+        function renderWordList(el, entries, type) {
+          if (!entries.length) {
+            el.innerHTML = '<div class="muted" style="padding:6px 8px">暂无词条</div>';
+            return;
+          }
+          el.innerHTML = entries.map(e => {
+            const w = typeof e === 'string' ? e : e.word;
+            const ruleId = typeof e === 'object' && e.rule_id ? e.rule_id : null;
+            const addedBy = typeof e === 'object' && e.added_by ? e.added_by : null;
+            return `
+            <div class="rule-item ${type}">
+              <span>${esc(w)}</span>
+              ${ruleId ? `<code class="rule-id" title="规则ID（UCPD/GDPR 举证）">${esc(ruleId)}</code>` : ''}
+              ${addedBy ? `<span class="muted rule-by" title="添加人">${esc(addedBy)}</span>` : ''}
+              <button class="btn-sm del" title="删除">删</button>
+            </div>`;
+          }).join('');
+          el.querySelectorAll('.rule-item').forEach(item => {
+            item.querySelector('.del').addEventListener('click', async function () {
+              const word = item.querySelector('span').textContent;
+              if (!confirm(`确定删除${type === 'banned' ? '禁用' : '安全'}词「${word}」？`)) return;
+              try {
+                // 词是路径参数，必须 encodeURIComponent
+                await api(`/admin/api/rules/${sel.value}/${type}/${encodeURIComponent(word)}`, { method: 'DELETE' });
+                toast('已删除');
+                loadRules();
+              } catch (e) { toast(e.message, false); }
+            });
+          });
+        }
+
+        async function loadRules() {
+          try {
+            const data = await api(`/admin/api/rules/${sel.value}`);
+            renderWordList(document.getElementById('rl-banned-list'), data.banned_entries || data.banned || [], 'banned');
+            renderWordList(document.getElementById('rl-safe-list'), data.safe_entries || data.safe || [], 'safe');
+            document.getElementById('rl-banned-count').textContent = `(${(data.banned || data.banned_entries || []).length})`;
+            document.getElementById('rl-safe-count').textContent = `(${(data.safe || data.safe_entries || []).length})`;
+          } catch (e) { toast(e.message, false); }
+        }
+
+        async function addWord(type) {
+          const input = document.getElementById('rl-' + type + '-input');
+          const word = input.value.trim();
+          if (!word) return;
+          try {
+            const res = await api(`/admin/api/rules/${sel.value}/${type}`, { method: 'POST', body: { word } });
+            toast(res.message || '已添加');
+            input.value = '';
+            loadRules();
+          } catch (e) { toast(e.message, false); }
+        }
+
+        document.getElementById('rl-banned-add').addEventListener('click', () => addWord('banned'));
+        document.getElementById('rl-safe-add').addEventListener('click', () => addWord('safe'));
+        document.getElementById('rl-banned-input').addEventListener('keydown', e => { if (e.key === 'Enter') addWord('banned'); });
+        document.getElementById('rl-safe-input').addEventListener('keydown', e => { if (e.key === 'Enter') addWord('safe'); });
+
+        loadRules();
+      }
+    })();
+
+    /* ===== 锚点库 ===== */
+    (function () {
+      TABS.anchors = { init: init };
+      function init() {
+        let searchTimer = null;
+        document.getElementById('an-search').addEventListener('input', function () {
+          clearTimeout(searchTimer);
+          searchTimer = setTimeout(() => pager.goFirst().catch(e => toast(e.message, false)), 300);
+        });
+        document.getElementById('an-category').addEventListener('change', () => pager.goFirst().catch(e => toast(e.message, false)));
+
+        let nextOffset = null;
+        const pager = createPager(loadPage);
+
+        async function loadPage(cursor) {
+          const q = new URLSearchParams({ limit: '20' });
+          if (document.getElementById('an-search').value.trim()) q.set('search', document.getElementById('an-search').value.trim());
+          if (document.getElementById('an-category').value.trim()) q.set('category', document.getElementById('an-category').value.trim());
+          if (cursor) q.set('cursor', cursor);
+          const data = await api('/admin/api/anchors?' + q.toString());
+          nextOffset = data.next_offset;
+          renderRows(data.items);
+          document.getElementById('an-sub').textContent = `共 ${data.total_count} 个锚点词`;
+          document.getElementById('an-next').disabled = (nextOffset === null || nextOffset === undefined);
+          document.getElementById('an-prev').disabled = !pager.canPrev();
+          document.getElementById('an-page-info').textContent =
+            `第 ${pager.page()} 页 · 本页 ${data.count} 条`;
+        }
+
+        function renderRows(items) {
+          const tbody = document.getElementById('an-tbody');
+          if (!items.length) {
+            tbody.innerHTML = '<tr class="empty-row"><td colspan="5">没有符合条件的锚点词</td></tr>';
+            return;
+          }
+          tbody.innerHTML = items.map(it => `
+            <tr data-id="${esc(it.id)}">
+              <td><strong>${esc(it.cn_word)}</strong></td>
+              <td>${esc(it.category || '–')}</td>
+              <td>${it.linked_tags_count}</td>
+              <td class="muted">${esc((it.created_at || '').replace('T', ' ').slice(0, 19))}</td>
+              <td><button class="btn-sm btn-danger del">删除</button></td>
+            </tr>`).join('');
+
+          tbody.querySelectorAll('tr[data-id]').forEach(tr => {
+            tr.querySelector('.del').addEventListener('click', withLoading(tr.querySelector('.del'), async () => {
+              const word = tr.querySelector('td strong').textContent;
+              if (!confirm(`确定删除锚点「${word}」？`)) return;
+              const res = await api(`/admin/api/anchors/${encodeURIComponent(tr.dataset.id)}`, { method: 'DELETE' });
+              toast(res.message);
+              await pager.goFirst();
+            }));
+          });
+        }
+
+        document.getElementById('an-prev').addEventListener('click', () => pager.prev().catch(e => toast(e.message, false)));
+        document.getElementById('an-next').addEventListener('click', () => pager.next(nextOffset).catch(e => toast(e.message, false)));
+        document.getElementById('an-refresh').addEventListener('click', () => pager.goFirst().catch(e => toast(e.message, false)));
+
+        pager.goFirst().catch(e => toast(e.message, false));
+      }
+    })();
+
+    /* ===== 拦截记录 ===== */
+    (function () {
+      TABS.blocked = { init: init };
+      function init() {
+        const sel = document.getElementById('bk-country');
+        sel.innerHTML = countryOptions('');
+        sel.addEventListener('change', () => pager.goFirst().catch(e => toast(e.message, false)));
+
+        let nextOffset = null;
+        const PAGE_SIZE = 20;
+        const pager = createOffsetPager(loadPage, PAGE_SIZE);
+
+        async function loadPage(offset) {
+          const q = new URLSearchParams({ limit: String(PAGE_SIZE), offset: String(offset) });
+          if (sel.value) q.set('country', sel.value);
+          const data = await api('/admin/api/blocked?' + q.toString());
+          nextOffset = pager.computeNext(data.total_count);
+          renderRows(data.items);
+          document.getElementById('bk-sub').textContent = `共 ${data.total_count} 条拦截决策`;
+          document.getElementById('bk-next').disabled = nextOffset === null;
+          document.getElementById('bk-prev').disabled = !pager.canPrev();
+          document.getElementById('bk-page-info').textContent =
+            `第 ${pager.page()} 页 · 本页 ${data.count} 条`;
+        }
+
+        function renderRows(items) {
+          const tbody = document.getElementById('bk-tbody');
+          if (!items.length) {
+            tbody.innerHTML = '<tr class="empty-row"><td colspan="8">暂无拦截记录</td></tr>';
+            return;
+          }
+          tbody.innerHTML = items.map(it => `
+            <tr data-id="${esc(it.id)}">
+              <td><strong>${esc(it.word)}</strong></td>
+              <td><span class="badge info">${esc(it.country)}</span></td>
+              <td>${esc(it.category || '–')}</td>
+              <td><div class="reason">${esc(it.reason || '')}</div></td>
+              <td><code>${esc(it.rule_id || '–')}</code></td>
+              <td class="muted">${esc(it.source || '–')}</td>
+              <td class="muted">${esc((it.created_at || '').replace('T', ' ').slice(0, 19))}</td>
+              <td><button class="btn-sm btn-danger del">删除</button></td>
+            </tr>`).join('');
+
+          tbody.querySelectorAll('tr[data-id]').forEach(tr => {
+            tr.querySelector('.del').addEventListener('click', withLoading(tr.querySelector('.del'), async () => {
+              const word = tr.querySelector('td strong').textContent;
+              if (!confirm(`确定删除拦截记录「${word}」？（合规证据，请谨慎）`)) return;
+              const res = await api(`/admin/api/blocked/${encodeURIComponent(tr.dataset.id)}`, { method: 'DELETE' });
+              toast(res.message);
+              await pager.goFirst();
+            }));
+          });
+        }
+
+        document.getElementById('bk-prev').addEventListener('click', () => pager.prev().catch(e => toast(e.message, false)));
+        document.getElementById('bk-next').addEventListener('click', () => pager.next(nextOffset).catch(e => toast(e.message, false)));
+        document.getElementById('bk-refresh').addEventListener('click', () => pager.goFirst().catch(e => toast(e.message, false)));
+
+        pager.goFirst().catch(e => toast(e.message, false));
+      }
+    })();
+
+    /* ===== 审计日志 ===== */
+    (function () {
+      TABS.audit = { init: init };
+      function init() {
+        const sel = document.getElementById('au-action');
+        sel.addEventListener('change', () => pager.goFirst().catch(e => toast(e.message, false)));
+
+        let nextOffset = null;
+        const PAGE_SIZE = 20;
+        const pager = createOffsetPager(loadPage, PAGE_SIZE);
+
+        async function loadPage(offset) {
+          const q = new URLSearchParams({ limit: String(PAGE_SIZE), offset: String(offset) });
+          if (sel.value) q.set('action', sel.value);
+          let data;
+          try {
+            data = await api('/admin/api/audit?' + q.toString());
+          } catch (e) {
+            if (permissionEmpty(document.getElementById('au-tbody'), 7, e)) {
+              document.getElementById('au-sub').textContent = '';
+              return;
+            }
+            throw e;
+          }
+          nextOffset = pager.computeNext(data.total);
+          renderRows(data.items);
+          document.getElementById('au-sub').textContent = `共 ${data.total} 条审计记录`;
+          document.getElementById('au-next').disabled = nextOffset === null;
+          document.getElementById('au-prev').disabled = !pager.canPrev();
+          document.getElementById('au-page-info').textContent =
+            `第 ${pager.page()} 页 · 本页 ${data.items.length} 条`;
+        }
+
+        function renderRows(items) {
+          const tbody = document.getElementById('au-tbody');
+          if (!items.length) {
+            tbody.innerHTML = '<tr class="empty-row"><td colspan="7">暂无审计记录</td></tr>';
+            return;
+          }
+          tbody.innerHTML = items.map(it => {
+            const snapshot = { ...(it.resource_snapshot || {}), ...(it.detail || {}) };
+            const snapText = Object.keys(snapshot).length
+              ? Object.entries(snapshot).map(([k, v]) => `${esc(k)}=${esc(typeof v === 'object' ? JSON.stringify(v) : v)}`).join(' ')
+              : '–';
+            return `
+            <tr>
+              <td class="muted">${esc(it.id)}</td>
+              <td class="muted">${esc((it.ts || '').replace('T', ' ').slice(0, 19))}</td>
+              <td><strong>${esc(it.actor_username || it.actor_sub || 'system')}</strong></td>
+              <td>${esc((it.actor_roles || []).join(', ') || '–')}</td>
+              <td><code>${esc(it.action)}</code></td>
+              <td>${esc(it.resource_type)}/${esc(it.resource_id || '–')}</td>
+              <td><div class="reason">${snapText}</div></td>
+            </tr>`;
+          }).join('');
+        }
+
+        document.getElementById('au-verify').addEventListener('click', withLoading(document.getElementById('au-verify'), async () => {
+          const res = await api('/admin/api/audit/verify');
+          if (res.ok) {
+            toast(res.detail || '哈希链校验通过');
+          } else {
+            toast(`哈希链校验失败：${res.detail}`, false);
+          }
+        }));
+
+        document.getElementById('au-prev').addEventListener('click', () => pager.prev().catch(e => toast(e.message, false)));
+        document.getElementById('au-next').addEventListener('click', () => pager.next(nextOffset).catch(e => toast(e.message, false)));
+        document.getElementById('au-refresh').addEventListener('click', () => pager.goFirst().catch(e => toast(e.message, false)));
+
+        pager.goFirst().catch(e => toast(e.message, false));
+      }
+    })();
+
+    /* ===== DSAR 工单 ===== */
+    (function () {
+      TABS.dsar = { init: init };
+      function init() {
+        const sel = document.getElementById('ds-status');
+        sel.addEventListener('change', () => pager.goFirst().catch(e => toast(e.message, false)));
+
+        let nextOffset = null;
+        const PAGE_SIZE = 20;
+        const pager = createOffsetPager(loadPage, PAGE_SIZE);
+        let currentTicket = null;
+
+        const TYPE_LABEL = { access: '访问权', erasure: '删除权', objection: '反对权' };
+
+        async function loadPage(offset) {
+          const q = new URLSearchParams({ limit: String(PAGE_SIZE), offset: String(offset) });
+          if (sel.value) q.set('status', sel.value);
+          let data;
+          try {
+            data = await api('/admin/api/dsar?' + q.toString());
+          } catch (e) {
+            if (permissionEmpty(document.getElementById('ds-tbody'), 7, e)) {
+              document.getElementById('ds-sub').textContent = '';
+              return;
+            }
+            throw e;
+          }
+          nextOffset = pager.computeNext(data.total);
+          renderRows(data.items);
+          document.getElementById('ds-sub').textContent = `共 ${data.total} 个工单`;
+          document.getElementById('ds-next').disabled = nextOffset === null;
+          document.getElementById('ds-prev').disabled = !pager.canPrev();
+          document.getElementById('ds-page-info').textContent =
+            `第 ${pager.page()} 页 · 本页 ${data.items.length} 条`;
+        }
+
+        function renderRows(items) {
+          const tbody = document.getElementById('ds-tbody');
+          if (!items.length) {
+            tbody.innerHTML = '<tr class="empty-row"><td colspan="7">暂无工单</td></tr>';
+            return;
+          }
+          tbody.innerHTML = items.map(it => `
+            <tr data-id="${esc(it.ticket_id)}">
+              <td><code>${esc(it.ticket_id.slice(0, 8))}…</code></td>
+              <td class="muted">${esc((it.ts || '').replace('T', ' ').slice(0, 19))}</td>
+              <td><span class="badge info">${esc(TYPE_LABEL[it.request_type] || it.request_type)}</span></td>
+              <td><span class="badge ${it.status === 'completed' ? 'ok' : 'warn'}">${esc(it.status)}</span></td>
+              <td>${esc(it.contact)}</td>
+              <td><div class="reason">${esc((it.subject_note || '').slice(0, 80))}</div></td>
+              <td><button class="btn-sm detail">详情</button></td>
+            </tr>`).join('');
+
+          tbody.querySelectorAll('tr[data-id]').forEach(tr => {
+            tr.querySelector('.detail').addEventListener('click', () => showDetail(tr.dataset.id));
+          });
+        }
+
+        async function showDetail(ticketId) {
+          currentTicket = ticketId;
+          const data = await api('/admin/api/dsar/' + encodeURIComponent(ticketId));
+          const card = document.getElementById('ds-detail-card');
+          card.style.display = 'block';
+          const summary = {
+            ticket_id: data.ticket_id, request_type: data.request_type, status: data.status,
+            contact: data.contact, subject_note: data.subject_note, created_by: data.created_by,
+            completed_at: data.completed_at, findings: data.findings, erasure_proof: data.erasure_proof,
+          };
+          document.getElementById('ds-detail').textContent = JSON.stringify(summary, null, 2);
+          card.scrollIntoView();
+        }
+
+        document.getElementById('ds-search-btn').addEventListener('click', withLoading(document.getElementById('ds-search-btn'), async () => {
+          const term = document.getElementById('ds-term').value.trim();
+          if (!term || !currentTicket) return;
+          const res = await api(`/admin/api/dsar/${encodeURIComponent(currentTicket)}/search`, { method: 'POST', body: { term } });
+          document.getElementById('ds-detail').textContent = JSON.stringify(res.findings, null, 2);
+          toast('检索完成，结果已写入工单 findings');
+          pager.goFirst();
+        }));
+
+        document.getElementById('ds-erase-btn').addEventListener('click', withLoading(document.getElementById('ds-erase-btn'), async () => {
+          const term = document.getElementById('ds-term').value.trim();
+          if (!term || !currentTicket) return;
+          if (!confirm(`确定执行删除权（Art.17）擦除「${term}」？\n将硬删除 Qdrant 全部 4 集合中的该词条、删除 LLM 留痕、脱敏审计记录，不可逆！`)) return;
+          const res = await api(`/admin/api/dsar/${encodeURIComponent(currentTicket)}/erase`, { method: 'POST', body: { term } });
+          document.getElementById('ds-detail').textContent = JSON.stringify(res.erasure_proof, null, 2);
+          toast('擦除完成，工单已闭环');
+          pager.goFirst();
+        }));
+
+        document.getElementById('ds-prev').addEventListener('click', () => pager.prev().catch(e => toast(e.message, false)));
+        document.getElementById('ds-next').addEventListener('click', () => pager.next(nextOffset).catch(e => toast(e.message, false)));
+        document.getElementById('ds-refresh').addEventListener('click', () => pager.goFirst().catch(e => toast(e.message, false)));
+
+        pager.goFirst().catch(e => toast(e.message, false));
+      }
+    })();
+
+    /* ===== 启动：按当前 hash 激活 tab ===== */
+    activateTab(currentHash());
+  </script>
+</body>
+</html>

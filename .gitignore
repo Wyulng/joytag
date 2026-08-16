@@ -1,0 +1,45 @@
+# Environment
+.env
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.venv/
+
+# Qdrant storage
+qdrant_storage/
+
+# Postgres data volume (2026-08 合规改造新增)
+pgdata/
+
+# Runtime state files (2026-08 合规改造新增)
+backend/cn_collection_progress.json
+backend/overseas_collection_progress.json
+backend/data/schedules/schedules.json
+# LLM 动态种子翻译缓存（运行时增量生成，可重建）
+backend/data/translation_cache.json
+
+# HuggingFace cache
+huggingface_cache/
+
+# File locks
+*.lock
+
+# Logs
+*.log
+
+# Claude
+.claude/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+backend/models/

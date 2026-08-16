@@ -1,0 +1,195 @@
+import logging
+from datetime import datetime, timezone
+from services.llm import assess_single, translate_foreign_to_chinese
+from services.embedding import get_embedding
+from services.qdrant_store import (
+    upsert_cn_anchor,
+    upsert_local_tag,
+    insert_pending_review,
+    insert_blocked_decision,
+    search_cn_anchor_by_word
+)
+from services.lineage import record_event, EVENT_OUTPUT
+
+logger = logging.getLogger(__name__)
+
+
+def _record_word_lineage(run_id: str, job_name: str, collection: str, word: str, country: str | None,
+                         action: str, detail: dict | None = None):
+    """词级血缘事件（best-effort）：单条词的入库/拦截决策，挂采集 run_id 供溯源检索。"""
+    facets = {"action": action}
+    if country:
+        facets["country"] = country
+    if detail:
+        facets["detail"] = detail
+    record_event(
+        run_id=run_id,
+        job_name=job_name,
+        event_type=EVENT_OUTPUT,
+        outputs=[{"namespace": "joytag.qdrant", "name": f"{collection}.{word}", "facets": facets}],
+    )
+
+
+# ==================== 处理中文长尾词（底座建设） ====================
+async def process_cn_longtail_word(cn_word: str, category: str = None,
+                                   provenance: dict = None, collection_run_id: str = None):
+    """
+    处理中文长尾词（纯概念底座，不做翻译）：
+    1. 生成中文原文向量
+    2. 存入 cn_anchors 集合（仅含中文词+向量，不含六国翻译）
+    provenance: 溯源元数据（source_type/collection_run_id/collected_at），EU 合规改造新增。
+    """
+    logger.info(f"[alignment] 处理中文长尾词: {cn_word}")
+    # 生成中文原文向量
+    vector = await get_embedding(cn_word)
+
+    # 存入中文锚点库
+    anchor_id = upsert_cn_anchor(cn_word, vector, category=category, provenance=provenance)
+    logger.info(f"[alignment] 中文锚点入库成功: {cn_word} (id={anchor_id})")
+    _record_word_lineage(collection_run_id or "manual", "cn_collection", "cn_anchors",
+                         cn_word, None, "inserted")
+    # 返回空 assessments（MVP 阶段中文锚点不预翻译）
+    return anchor_id, {}
+
+
+# ==================== 处理海外趋势词（最终输出源） ====================
+async def process_overseas_word(word: str, country: str, anchor_cn_id: str = None,
+                                category: str = None, trend_score: float = 0.0,
+                                source: str = "overseas", collection_run_id: str = None):
+    """
+    处理海外趋势词（本地化词汇）：
+    1. 将海外词翻译为中文，查找对应的中文锚点
+    2. 执行三级漏斗：规则库硬拦截 → LLM软判定
+    3. 可复用 → 生成向量 → 存入 local_tags（关联到中文锚点）
+    4. 存疑 → 写入 pending_review 队列
+    5. 需拦截 → 持久化到 blocked_decisions（UCPD/GDPR 决策留痕，不再丢弃）
+    6. 未找到对应中文锚点 → 写入 pending_review（需人工补充锚点）
+    """
+    logger.info(f"[alignment] 处理海外词: {word} ({country}, source={source})")
+    provenance = {
+        "source_type": source,
+        "collection_run_id": collection_run_id,
+        "collected_at": datetime.now(timezone.utc).isoformat(),
+    }
+    # 第0步：翻译海外词为中文，查找对应锚点
+    cn_word = await translate_foreign_to_chinese(word)
+    logger.info(f"[alignment] 海外词翻译为中文: {word} -> {cn_word}")
+    cn_vector = await get_embedding(cn_word)
+    anchor_info = search_cn_anchor_by_word(cn_word, cn_vector, score_threshold=0.75)
+
+    resolved_anchor_cn_id = anchor_info["id"] if anchor_info else None
+    resolved_cn_word = anchor_info["cn_word"] if anchor_info else cn_word
+
+    status, reason, rule_id, trace_id = await assess_single(word, country, category=category)
+    logger.info(f"[alignment] 评估结果: {word} ({country}) -> {status}")
+
+    if status == "可复用":
+        if resolved_anchor_cn_id is None:
+            # 未找到中文锚点，降级为存疑，需人工补充锚点
+            logger.warning(f"[alignment] 未找到中文锚点: {cn_word}，降级为存疑")
+            pending_id = insert_pending_review(
+                word=word,
+                country=country,
+                assessment_reason=reason + f" [未找到对应中文锚点：{cn_word}]",
+                source=source,
+                category=category,
+                cn_original=cn_word,
+                provenance=provenance,
+                llm_trace_id=trace_id,
+                rule_ids=[rule_id] if rule_id else None,
+                assessed_by="llm"
+            )
+            _record_word_lineage(collection_run_id or "manual", "overseas_collection",
+                                 "pending_review", word, country, "pending_no_anchor",
+                                 {"cn_word": cn_word})
+            return {
+                "stored": False,
+                "action": "pending_no_anchor",
+                "pending_id": pending_id,
+                "status": "存疑",
+                "reason": reason,
+                "cn_word": cn_word
+            }
+
+        vector = await get_embedding(word)
+        tag_id = upsert_local_tag(
+            word=word,
+            vector=vector,
+            country=country,
+            compliance_status=status,
+            reason=reason,
+            anchor_cn_id=resolved_anchor_cn_id,
+            anchor_cn_word=resolved_cn_word,
+            source=source,
+            category=category,
+            trend_score=trend_score,
+            provenance=provenance,
+            llm_trace_id=trace_id,
+            rule_ids=[rule_id] if rule_id else None,
+            assessed_by="llm"
+        )
+        logger.info(f"[alignment] 海外词入库成功: {word} ({country}, id={tag_id})")
+        _record_word_lineage(collection_run_id or "manual", "overseas_collection",
+                             "local_tags", word, country, "approved",
+                             {"anchor_cn_word": resolved_cn_word})
+        return {
+            "stored": True,
+            "action": "approved",
+            "id": tag_id,
+            "status": status,
+            "reason": reason,
+            "anchor_cn_word": resolved_cn_word
+        }
+
+    elif status == "存疑":
+        logger.info(f"[alignment] 海外词存疑，写入待审核: {word} ({country})")
+        pending_id = insert_pending_review(
+            word=word,
+            country=country,
+            assessment_reason=reason,
+            source=source,
+            category=category,
+            cn_original=cn_word,
+            provenance=provenance,
+            llm_trace_id=trace_id,
+            rule_ids=[rule_id] if rule_id else None,
+            assessed_by="llm"
+        )
+        _record_word_lineage(collection_run_id or "manual", "overseas_collection",
+                             "pending_review", word, country, "pending",
+                             {"cn_word": cn_word})
+        return {
+            "stored": False,
+            "action": "pending",
+            "pending_id": pending_id,
+            "status": status,
+            "reason": reason,
+            "cn_word": cn_word
+        }
+
+    else:  # "需拦截" —— 持久化决策留痕（UCPD/GDPR 举证，不再丢弃）
+        logger.info(f"[alignment] 海外词被拦截，写入 blocked_decisions: {word} ({country}, rule_id={rule_id})")
+        blocked_id = insert_blocked_decision(
+            word=word,
+            country=country,
+            reason=reason,
+            source=source,
+            category=category,
+            cn_word=cn_word,
+            rule_id=rule_id,
+            llm_trace_id=trace_id,
+            trend_score=trend_score,
+            provenance=provenance
+        )
+        _record_word_lineage(collection_run_id or "manual", "overseas_collection",
+                             "blocked_decisions", word, country, "blocked",
+                             {"cn_word": cn_word, "rule_id": rule_id})
+        return {
+            "stored": False,
+            "action": "blocked",
+            "blocked_id": blocked_id,
+            "status": status,
+            "reason": reason,
+            "rule_id": rule_id,
+            "cn_word": cn_word
+        }

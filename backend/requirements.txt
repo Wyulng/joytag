@@ -1,0 +1,18 @@
+fastapi==0.115.0
+uvicorn==0.30.6
+httpx==0.27.0
+qdrant-client==1.10.0
+pydantic==2.9.0
+python-dotenv==1.0.0
+apscheduler==3.10.4
+filelock==3.13.1
+requests==2.32.3
+sentence-transformers>=3.0.0
+slowapi==0.1.9
+# ==== EU 合规改造新增（2026-08）====
+authlib==1.3.0
+psycopg[binary]==3.1.19
+psycopg-pool==3.2.2
+presidio-analyzer==2.2.355
+itsdangerous==2.2.0
+cryptography==42.0.8
