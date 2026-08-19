@@ -1,5 +1,7 @@
 # Environment
 .env
+.env.*
+!.env.example
 
 # Python
 __pycache__/
@@ -43,3 +45,6 @@ huggingface_cache/
 .DS_Store
 Thumbs.db
 backend/models/
+
+# Local agent instructions
+/AGENTS.md
