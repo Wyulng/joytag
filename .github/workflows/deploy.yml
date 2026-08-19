@@ -19,3 +19,4 @@ jobs:
           python-version: '3.11'
       - run: pip install -r requirements.txt
       - run: python -m compileall .
+      - run: PYTHONPATH=. python -c "import app; print('backend import ok')"

@@ -26,6 +26,11 @@ def _build_trigger(cron: str) -> CronTrigger:
     )
 
 
+def validate_cron(cron: str) -> None:
+    """Validate a user-supplied five-field cron expression without scheduling it."""
+    _build_trigger(cron)
+
+
 async def _run_cn_async():
     """后台执行中文采集（调度器回调）"""
     try:

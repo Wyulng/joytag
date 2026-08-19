@@ -173,10 +173,35 @@ async def rerank_tags_with_llm(
 
     try:
         result = json.loads(clean)
-        recommendations = result.get("recommendations", [])
-        logger.info(f"[recommend] LLM 精排成功: 返回 {len(recommendations)} 个推荐")
-        return recommendations[:max_output]
-    except json.JSONDecodeError:
+        raw_recommendations = result.get("recommendations", []) if isinstance(result, dict) else []
+        candidate_words = {c["word"] for c in top_candidates}
+        selected = []
+        selected_words = set()
+        for rec in raw_recommendations:
+            if not isinstance(rec, dict):
+                continue
+            word = rec.get("word")
+            if word not in candidate_words or word in selected_words:
+                continue
+            reason = rec.get("reason")
+            if not isinstance(reason, str) or not reason.strip():
+                reason = "基于候选标签与商品信息匹配"
+            selected.append({"word": word, "reason": reason.strip(), "ai_generated": True})
+            selected_words.add(word)
+            if len(selected) >= max_output:
+                break
+        # Fill short or malformed model output only with already-vetted
+        # candidates. A model must never introduce a new tag into the API.
+        for c in candidates_sorted:
+            if len(selected) >= max_output:
+                break
+            if c["word"] in selected_words:
+                continue
+            selected.append({"word": c["word"], "reason": "基于向量相似度推荐", "ai_generated": False})
+            selected_words.add(c["word"])
+        logger.info(f"[recommend] LLM 精排成功: 返回 {len(selected)} 个推荐")
+        return selected
+    except (json.JSONDecodeError, TypeError, AttributeError):
         logger.warning(f"[recommend] LLM 精排响应解析失败，回退到向量相似度排序")
         fallback = []
         for c in candidates_sorted[:max_output]:

@@ -141,18 +141,36 @@ def redact_audit_for_erasure(subject_terms: list[str]) -> int:
     """DSAR 擦除：将匹配词在 snapshot/detail 中替换为 <REDACTED>（保链，不删行）。返回受影响行数。"""
     if not subject_terms:
         return 0
+    def redact(value):
+        if isinstance(value, str):
+            new_value = value
+            for term in subject_terms:
+                new_value = new_value.replace(term, "<REDACTED>")
+            return new_value, new_value != value
+        if isinstance(value, dict):
+            changed = False
+            result = {}
+            for key, item in value.items():
+                new_item, item_changed = redact(item)
+                result[key] = new_item
+                changed = changed or item_changed
+            return result, changed
+        if isinstance(value, list):
+            changed = False
+            result = []
+            for item in value:
+                new_item, item_changed = redact(item)
+                result.append(new_item)
+                changed = changed or item_changed
+            return result, changed
+        return value, False
+
     rows = fetchall("SELECT id, resource_snapshot, detail FROM audit_log")
     affected = 0
     for row_id, snapshot, detail in rows:
-        changed = False
-        new_snapshot, new_detail = snapshot, detail
-        for term in subject_terms:
-            if snapshot and term in str(snapshot):
-                new_snapshot = json.loads(str(snapshot).replace(term, "<REDACTED>"))
-                changed = True
-            if detail and term in str(detail):
-                new_detail = json.loads(str(detail).replace(term, "<REDACTED>"))
-                changed = True
+        new_snapshot, snapshot_changed = redact(snapshot)
+        new_detail, detail_changed = redact(detail)
+        changed = snapshot_changed or detail_changed
         if changed:
             execute(
                 "UPDATE audit_log SET resource_snapshot = %s, detail = %s WHERE id = %s",

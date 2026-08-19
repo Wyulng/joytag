@@ -76,7 +76,7 @@ def _scroll_all(
             scroll_filter=filter_condition,
             limit=batch_size,
             offset=next_offset,
-            with_payload=payload_keys,
+            with_payload=True if payload_keys is None else payload_keys,
             with_vectors=False,
         )
         all_records.extend(records)
@@ -304,6 +304,8 @@ def count_local_tags(country: str = None, category: str = None, search: str = No
         conditions.append(FieldCondition(key="country", match=MatchValue(value=country)))
     if category:
         conditions.append(FieldCondition(key="category", match=MatchValue(value=category)))
+    if search:
+        conditions.append(FieldCondition(key="word", match=MatchText(text=search)))
 
     filter_condition = Filter(must=conditions) if conditions else None
 
@@ -676,8 +678,9 @@ def search_words_exact(word: str, country: str = None) -> list[dict]:
     client = get_qdrant_client()
     results = []
     for collection in _ALL_COLLECTIONS:
-        conditions = [FieldCondition(key="word", match=MatchValue(value=word))]
-        if country:
+        word_field = "cn_word" if collection == ANCHOR_COLLECTION else "word"
+        conditions = [FieldCondition(key=word_field, match=MatchValue(value=word))]
+        if country and collection != ANCHOR_COLLECTION:
             conditions.append(FieldCondition(key="country", match=MatchValue(value=country)))
         records = _scroll_all(
             collection_name=collection,
@@ -694,17 +697,21 @@ def delete_points_by_word(word: str, country: str = None) -> int:
     跨 4 个集合执行，返回删除总数。
     """
     client = get_qdrant_client()
-    conditions = [FieldCondition(key="word", match=MatchValue(value=word))]
-    if country:
-        conditions.append(FieldCondition(key="country", match=MatchValue(value=country)))
-    filter_condition = Filter(must=conditions)
     deleted = 0
     for collection in _ALL_COLLECTIONS:
+        word_field = "cn_word" if collection == ANCHOR_COLLECTION else "word"
+        conditions = [FieldCondition(key=word_field, match=MatchValue(value=word))]
+        if country and collection != ANCHOR_COLLECTION:
+            conditions.append(FieldCondition(key="country", match=MatchValue(value=country)))
+        filter_condition = Filter(must=conditions)
+        matching = _scroll_all(collection, filter_condition, payload_keys=[word_field])
         result = client.delete(
             collection_name=collection,
             points_selector=FilterSelector(filter=filter_condition)
         )
-        deleted += len(result)
+        # Qdrant returns UpdateResult, not the deleted points. Count the
+        # matching records before issuing the hard-delete operation.
+        deleted += len(matching)
     logger.info(f"[qdrant] DSAR 硬删除: word={word}, country={country}, deleted={deleted}")
     return deleted
 

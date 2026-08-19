@@ -37,8 +37,9 @@ def _strip_json_fence(raw: str) -> str:
     cleaned = raw.strip()
     cleaned = _THINK_TAG_RE.sub('', cleaned)
     cleaned = cleaned.strip()
-    if cleaned.startswith("```json"):
-        cleaned = cleaned[7:]
+    if cleaned.startswith("```"):
+        first_newline = cleaned.find("\n")
+        cleaned = cleaned[first_newline + 1:] if first_newline >= 0 else cleaned[3:]
     if cleaned.endswith("```"):
         cleaned = cleaned[:-3]
     return cleaned.strip()
@@ -148,8 +149,15 @@ async def assess_single(word: str, country: str, category: str | None = None) ->
     )
     content = result.content
     parsed = _parse_json_fallback(content)
-    assessment: AssessmentResult = parsed.get("result", "存疑")
-    reason = parsed.get("reason", "解析失败")
+    assessment = parsed.get("result")
+    if assessment not in ("可复用", "需拦截", "存疑"):
+        # Never let an untrusted model string fall through to the blocking
+        # branch in alignment.py. Unknown output is reviewable, not blocked.
+        assessment = "存疑"
+    reason = parsed.get("reason")
+    if not isinstance(reason, str) or not reason.strip():
+        reason = "LLM 返回的判定理由无效，请人工审核"
+    reason = reason.strip()[:200]
     # 解析后统一留痕（含结构化结果，避免与重试包装器重复记录）
     trace_id = _record_trace("assess", messages=messages, result=result, latency_ms=result.latency_ms,
                              retry_count=0, prompt_pii=pii_map, word=word, parsed=parsed)
@@ -172,8 +180,8 @@ async def translate_foreign_to_chinese(foreign_word: str) -> str:
     result = await _call_llm_with_retry(
         messages, temperature=0.1, call_type="translate", word=foreign_word, prompt_pii=pii_map
     )
-    chinese_word = result.content.strip()
-    chinese_word = _THINK_TAG_RE.sub('', chinese_word)
+    chinese_word = _strip_json_fence(result.content)
+    chinese_word = chinese_word.strip().strip('"')
     return chinese_word
 
 

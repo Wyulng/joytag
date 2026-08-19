@@ -43,3 +43,8 @@ huggingface_cache/
 .DS_Store
 Thumbs.db
 backend/models/
+# Keep application schemas tracked while ignoring the downloaded embedding model.
+backend/models/*
+!backend/models/
+!backend/models/__init__.py
+!backend/models/schemas.py

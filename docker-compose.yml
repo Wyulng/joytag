@@ -79,7 +79,7 @@ services:
       - KC_HOSTNAME_STRICT=false
       - KC_PROXY=edge
     volumes:
-      - ./keycloak/import:/opt/keycloak/data/import:ro
+      - ./keycloak/realm-export.json:/opt/keycloak/data/import/realm-export.json:ro
     depends_on:
       postgres:
         condition: service_healthy
