@@ -1,6 +1,6 @@
 # Joytag EU 合规改造方案（GDPR / DSA / UCPD + AI Act 附带）
 
-> 状态：**代码改造全部完成**（2026-08-15，首次 git commit）。本文件为实施蓝图，进度以代码为准。
+> 状态：**代码内合规控制已按当前仓库落地**（截至 2026-08-20）。本文件同时保留历史实施蓝图；能力是否已实现以当前代码为准，法律结论仍需独立法律审查。
 >
 > ## 〇、执行进度
 >
@@ -14,14 +14,14 @@
 
 ## 一、背景与目标
 
-Joytag 为 Joybuy 欧盟站点提供长尾标签推荐，涉及：Reddit/Taobao 公开数据采集 → DeepSeek LLM 翻译/合规审核 → Qdrant 存储 → 推荐 API 输出。生产环境部署于腾讯云（P0 改造前：8001 无 TLS 无认证直连公网；现已收敛为 Keycloak SSO + 端口改绑 127.0.0.1）。
+Joytag 为 Joybuy 欧洲站点提供长尾标签推荐：淘宝搜索建议构建中文锚点，Amazon 搜索建议作为海外主源，eBay 搜索建议作为海外辅助源；词条经翻译、锚点检索、规则检查和 LLM 合规评估后写入 Qdrant，再由推荐 API 输出。LLM 通过 provider 适配层调用，默认配置为 DeepSeek/OpenAI-compatible，并可通过配置切换 Azure 或 Bedrock。生产配置已实现 Keycloak SSO、RBAC、CSRF 与端口改绑；TLS 仍需在实际部署时完成。
 
 目标：**技术层面**（代码与架构）使系统满足 GDPR（数据合规、透明度、删除权、出境）、DSA（推荐系统透明度、可解释）、UCPD（标签不得构成误导性商业行为）要求。不做合规申报文档，法规强制披露以代码功能落地（参数披露接口、DSAR 受理端点、透明度页面）。
 
 ## 二、法规调研结论
 
 ### GDPR 要点（对 Joytag 的影响）
-1. **公开数据采集合法依据**：EDPB《03/2026 网络爬取指南》（2026-07 通过）确认公开社交媒体数据仍受 GDPR 保护，爬取需以**合法利益**（Art. 6(1)(f)）为依据并完成三步测试：目的明确具体、必要性（采集范围最小化）、利益平衡。需排除敏感社区、尊重 robots.txt、**及时删除不相关/过度数据**。透明度方面可援引 Art. 14(5)(b)（告知不可能或不成比例），但须在网站公开详细隐私信息 + 来源清单，并提供**反对机制**；建议做 DPIA。
+1. **外部搜索建议数据的合法性与最小化**：当前采集对象是淘宝、Amazon 和 eBay 的搜索建议，不采集账号、帖子或用户档案。正式部署前仍需分别核验接口条款、数据库权利、合法处理依据、必要性与留存范围，并在透明度材料中列明来源和反对渠道；是否需要 DPIA 由法律顾问结合实际处理活动判断。
 2. **DeepSeek 出境是最大风险点**：中国无充分性认定（adequacy decision）；Berlin DPA 2025-05 认定 DeepSeek 违反 Art. 46(1) 并推动应用下架，意大利 Garante 2025-01 封锁。SCC + TIA（Schrems II）因 PIPL 强制披露义务极难通过。→ **LLM 提供方策略必须调整**（见决策 D1）。
 3. **删除权（Art. 17）**：删除须 30 天内完成；向量库层要求**入库时给每条 embedding 打主体/来源标识**，支持按元数据过滤删除；软删除有泄漏风险 → 用硬删除；日志需脱敏 + TTL 清理任务；LLM 调用痕迹需留存策略。删除操作本身要有审计记录。
 4. **处理活动记录（Art. 30）+ 可责性（Art. 5(2)）**：记录"谁在何时做了什么"，管理操作全审计。
@@ -63,33 +63,35 @@ Joytag 为 Joybuy 欧盟站点提供长尾标签推荐，涉及：Reddit/Taobao 
 | **Keycloak** | Apache-2.0 | 管理后台 SSO/RBAC/MFA | ✅ 采纳（用户要求最高标准） |
 | Trillian/sigstore | Apache-2.0 | 审计日志防篡改 | ⚠️ P0 自建 hash-chain 足够 |
 
-## 五、现状差距分析
+## 五、历史差距与当前闭环状态
 
-### 做得好的（保留）
-- 数据最小化基础较好：Reddit 仅提取标题（用户名/帖子 ID 不落盘）；日志不记 IP、不记请求体。
-- embedding 模型完全本地（无出境）；已有 X-Request-ID 中间件、慢操作 loading 态、esc() 转义等可复用模式。
+下表中的“改造前差距”用于解释实施缘由，不代表当前代码状态。
 
-### 差距（合规要求 → 技术改动）
+| # | 改造前差距 | 当前仓库实现 | 状态 |
+|---|-------------|---------------|------|
+| G1 | 管理变更无审计 | Postgres hash-chain 审计、操作者与 request ID 留痕、全链校验 | 已实现 |
+| G2 | LLM 地址硬编码、原文外发、无 trace | provider 适配层、PII 假名化、日志最小化、`llm_trace` | 已实现；供应商与跨境安排待部署方审查 |
+| G3 | 删除仅覆盖单库、无留存策略 | DSAR 跨 Qdrant/Postgres 检索与擦除、ERASE 事件、定时留存清理 | 已实现 |
+| G4 | 无公开披露与反对渠道 | `/transparency`、`/v1/transparency`、`/v1/dsar/request` | 已实现 |
+| G5 | 管理端无认证、基础设施端口暴露 | Keycloak OIDC、RBAC、TOTP、CSRF、服务 scope、端口绑定与必填密钥 | 已实现；TLS 待部署 |
+| D1 | 推荐参数与来源不可解释 | 版本化参数披露，响应保留 source、reason、anchor、trend 与 AI 标识 | 已实现 |
+| D2/T1 | 数据源、批次和审核链路断裂 | 采集 run/词级 lineage、provenance、拦截决策持久化 | 已实现 |
+| U1 | 环保声明规则与拦截证据不足 | UCPD Annex I 规则种子、规则 ID、LLM 评估与 `blocked_decisions` | 已实现；规则内容待法律复核 |
+| T2 | 完整标题日志与无限留存 | 哈希化/脱敏日志、容器轮转、Postgres 留存策略 | 已实现 |
 
-| # | 合规要求 | 现状差距 | 技术改动方向 |
-|---|---------|---------|-------------|
-| G1 | GDPR Art.5(2) 可责性 | **零审计**：删除/批准/拒绝/改规则/触发采集均不留痕不记操作者 | audit 模块 + Postgres hash-chain 审计表，全部管理变更端点挂钩子 |
-| G2 | GDPR 数据出境治理 | 完整商品标题原样发给 DeepSeek；端点/模型硬编码两处；LLM 调用无留痕 | provider 适配层（OpenAI 兼容 + Azure + Bedrock）；Presidio 假名化；发送最小化；llm_trace 留痕 |
-| G3 | GDPR Art.17 删除权 | 删除仅 Qdrant 单点；`需拦截` 词直接丢弃；无留存策略、日志无轮转 | 溯源元数据入库；DSAR 跨库搜索/删除；APScheduler 留存清理；docker log-opts |
-| G4 | GDPR 透明度 Art.13/14 | 无披露页、无反对机制 | `/transparency` 页 + `/v1/dsar/request` 受理端点 |
-| G5 | GDPR Art.25/32 安全 | **零认证**；8001/6333/6334 全接口暴露无 TLS；Qdrant 默认密钥硬编码 | Keycloak SSO + RBAC + MFA；端口绑定；TLS（P2 需域名）；密钥入 .env |
-| D1 | DSA Art.27 参数披露 | recommend 响应无 source/参数说明/版本化披露 | RecommendItem 加 provenance；`/v1/disclosure/parameters` 版本化接口 |
-| D2 | DSA 可追溯支持 | 审核决策链路断裂：审核人无记录、拒绝无理由 | lineage 事件全链路（采集→翻译→评估→审核→入库/拦截） |
-| U1 | UCPD Annex I（2026-09-27 生效） | banned 规则库大多为空；无环保声明分类；`需拦截` 词丢弃无证据 | rule_manager Annex I 类别种子；LLM 提示词升级；拦截决策持久化 |
-| A1 | AI Act Art.50 披露 | 响应无 AI 参与标识 | 响应 ai_generated 标记 + 透明度页声明 |
-| T1 | 溯源元数据 | source 硬编码 "overseas"；granular 来源被丢弃；无批次/模型名/prompt 版本/updated_at | provenance 字段全套入库 + lineage 事件 |
-| T2 | 日志合规 | recommend 日志记录完整标题；无轮转/保留 | 日志脱敏 + docker log-opts + 留存策略 |
+### 仍未完成或不能由代码单独完成
+
+- 域名、Caddy/等效反向代理、TLS 证书与 `TLS_ENABLED=true` 的生产部署。
+- 与真实客户商品库、运营上架系统或消费者搜索引擎的集成与效果验证。
+- Qdrant 与 Postgres 的自动备份、恢复演练、RPO/RTO 验收和灾难恢复记录。
+- 对数据源条款、处理依据、DPIA、供应商 DPA/SCC/TIA、国家广告规则和披露文本的独立法律审查。
+- 生产告警、密钥托管、渗透测试和访问控制复核。
 
 ### 关键决策（已确认）
 - **D1（LLM）**：保留 DeepSeek + 假名化 + 适配层，EU API 切换 = 纯配置变更（OpenAI 兼容系改 env 即换；Azure/Bedrock 预置薄分支）。
 - **D2（认证）**：最高标准 → Keycloak SSO（每人身份 + RBAC 角色 + MFA + OIDC 授权码+PKCE）；recommend API 走 client_credentials（scope `joytag:recommend`）。
 - 审计/溯源/trace 存 Postgres（Keycloak 共用实例分两库）。
-- 顺带修复现存 bug：`rule_manager.VALID_COUNTRIES` 缺 BE/LU 导致这两个国家的 approve/reject 崩溃；`recommend.py` 重复硬编码 DeepSeek URL。
+- 当前国家范围以代码中的 `DE/FR/NL/UK/IT/ES` 为准；LLM 调用统一走 provider 适配层，不在推荐模块重复硬编码供应商端点。
 
 ## 六、目标架构
 

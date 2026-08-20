@@ -24,7 +24,7 @@ Joytag 将中文商品锚点、欧洲多站点搜索建议和 AI 语义分析组
 3. 使用规则库、LLM 评估和人工审核构成合规漏斗。
 4. 将标签、来源、相似度、审核理由和运行批次一起保存，供推荐、审计和 DSAR 查询使用。
 
-Joytag 是一个后端服务和管理后台，不是面向消费者的搜索引擎，也不替代目标国家的法律、广告或平台政策审查。
+Joytag 当前是后端推荐 API 与管理后台，不是面向消费者的搜索引擎，也不是已经产品化的多租户 SaaS、店铺插件或商品上架工作台。它同样不替代目标国家的法律、广告或平台政策审查。
 
 ## 核心能力
 
@@ -127,7 +127,7 @@ Copy-Item .env.example .env
 ./dev.ps1
 ~~~
 
-首次安装脚本会创建 Python 3.11 虚拟环境、安装 `backend/requirements.txt`，并将 Embedding 模型下载到 `backend/models/bge-small-zh-v1.5/`。模型目录已被忽略，不会进入 Git。
+首次安装脚本会创建 Python 3.11 虚拟环境、安装 `backend/requirements.txt`，并将 Embedding 模型下载到 `backend/models/bge-small-zh-v1.5/`。只有该模型权重目录被忽略；`backend/models/__init__.py` 与 `backend/models/schemas.py` 是启动必需的运行时 API 契约源码，必须纳入 Git。
 
 启动后：
 
@@ -200,7 +200,7 @@ curl -X POST http://localhost:8001/v1/tag/recommend \
 | `GET /health` | 基础健康检查；`?deep=1` 同时检查 Qdrant、LLM 和 Postgres |
 | `GET /v1/disclosure/parameters` | DSA Art.27 机器可读的推荐参数披露 |
 | `GET /v1/transparency` | 公开透明度披露 JSON；`/transparency` 提供 HTML 版本 |
-| `POST /v1/dsar/request` | 公开受理数据主体访问、更正或删除请求，限流 5 次/小时 |
+| `POST /v1/dsar/request` | 公开受理数据主体访问、删除或反对请求，限流 5 次/小时 |
 
 ### 管理 API 与权限
 
@@ -282,11 +282,15 @@ Joytag 提供的是工程控制措施，不构成法律意见，也不自动保�
 
 ## 开发与验证
 
-项目没有配置 pytest 或专用 Python linter；当前 CI 在 Python 3.11 下安装依赖并执行 `compileall`。本地修改后可运行：
+项目使用标准库 `unittest` 做 API 契约测试，未引入 pytest 或专用 Python linter。CI 在 Python 3.11 下安装依赖后执行编译、应用导入和测试；其中导入检查能发现 `compileall` 无法发现的缺失运行时模块。本地修改后可运行：
 
 ~~~powershell
 git diff --check
 ./.venv/Scripts/python.exe -m compileall -q backend
+Push-Location backend
+../.venv/Scripts/python.exe -c "import app"
+../.venv/Scripts/python.exe -m unittest discover -s tests -v
+Pop-Location
 docker compose config
 ~~~
 
@@ -303,6 +307,8 @@ docker compose config
 ~~~text
 backend/
   app.py                         # FastAPI 路由与生命周期
+  models/
+    schemas.py                   # 受版本控制的 API 契约与合规常量（启动必需）
   services/
     collectors/                  # 中文、Amazon、eBay 采集和种子构建
     alignment.py                 # 翻译、锚点对齐、合规评估和入库
@@ -314,6 +320,7 @@ backend/
     lineage.py / dsar.py         # 血缘与数据主体请求
     auth.py / retention.py       # 认证和留存策略
   static/                        # 内嵌管理单页
+  tests/                         # unittest 接口契约与回退行为测试
 docs/EU_COMPLIANCE_PLAN.md       # EU 合规改造计划
 keycloak/                        # Keycloak realm 与数据库初始化脚本
 docker-compose.yml               # Qdrant、Postgres、Keycloak、Backend

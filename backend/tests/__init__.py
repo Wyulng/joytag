@@ -1,0 +1,1 @@
+"""JoyTag backend contract tests."""

@@ -3,7 +3,6 @@ import asyncio
 import json
 import logging
 import httpx
-from fastapi import HTTPException
 from services.embedding import get_embedding
 
 logger = logging.getLogger(__name__)
@@ -35,6 +34,71 @@ RERANK_SYSTEM_PROMPT = """你是一个欧洲电商本土化运营专家。你的
   ]
 }
 """
+
+
+def validate_rerank_recommendations(
+    recommendations: Any,
+    candidates: List[Dict[str, Any]],
+    max_output: int,
+) -> List[Dict[str, Any]]:
+    """Constrain LLM output to stored candidates and fill gaps by vector rank.
+
+    The LLM may only select and explain candidate tags. Unknown, malformed, and
+    duplicate words are ignored; deterministic vector-ranked candidates fill any
+    remaining slots so callers still receive a useful response.
+    """
+    candidates_sorted = sorted(
+        candidates,
+        key=lambda item: item.get("similarity", 0.0),
+        reverse=True,
+    )
+    candidate_by_word = {
+        candidate["word"].casefold(): candidate
+        for candidate in candidates_sorted
+        if isinstance(candidate.get("word"), str) and candidate["word"]
+    }
+    validated: List[Dict[str, Any]] = []
+    selected: set[str] = set()
+
+    if isinstance(recommendations, list):
+        for recommendation in recommendations:
+            if not isinstance(recommendation, dict):
+                continue
+            word = recommendation.get("word")
+            if not isinstance(word, str):
+                continue
+            key = word.strip().casefold()
+            candidate = candidate_by_word.get(key)
+            if candidate is None or key in selected:
+                continue
+            reason = recommendation.get("reason")
+            if not isinstance(reason, str) or not reason.strip():
+                reason = "基于 LLM 精排推荐"
+            validated.append({
+                "word": candidate["word"],
+                "reason": reason.strip(),
+                "ai_generated": True,
+            })
+            selected.add(key)
+            if len(validated) >= max_output:
+                return validated
+
+    for candidate in candidates_sorted:
+        word = candidate.get("word")
+        if not isinstance(word, str) or not word:
+            continue
+        key = word.casefold()
+        if key in selected:
+            continue
+        validated.append({
+            "word": word,
+            "reason": "基于向量相似度补充推荐",
+            "ai_generated": False,
+        })
+        selected.add(key)
+        if len(validated) >= max_output:
+            break
+    return validated
 
 
 async def retrieve_candidate_tags(
@@ -108,7 +172,7 @@ async def rerank_tags_with_llm(
     product_category: Optional[str],
     target_country: str,
     max_output: int = 5
-) -> List[Dict[str, str]]:
+) -> List[Dict[str, Any]]:
     if not candidates:
         logger.info("[recommend] 无候选标签，跳过 LLM 精排")
         return []
@@ -160,25 +224,35 @@ async def rerank_tags_with_llm(
             call_type="rerank", prompt_pii=pii_map
         )
     except httpx.TimeoutException:
-        logger.error("[rerank] LLM 请求超时")
-        raise HTTPException(status_code=504, detail="LLM 服务超时，请稍后重试")
+        logger.warning("[rerank] LLM 请求超时，回退到向量相似度排序")
+        return validate_rerank_recommendations([], top_candidates, max_output)
     except httpx.HTTPStatusError as e:
-        logger.error(f"[rerank] LLM 返回非 2xx: {e.response.status_code}")
-        raise HTTPException(status_code=502, detail="LLM 服务异常，请稍后重试")
+        logger.warning(
+            f"[rerank] LLM 返回非 2xx: {e.response.status_code}，回退到向量相似度排序"
+        )
+        return validate_rerank_recommendations([], top_candidates, max_output)
     except (httpx.HTTPError, KeyError) as e:
-        logger.error(f"[rerank] LLM 请求失败: {e}")
-        raise HTTPException(status_code=502, detail="LLM 服务异常，请稍后重试")
+        logger.warning(f"[rerank] LLM 请求失败: {e}，回退到向量相似度排序")
+        return validate_rerank_recommendations([], top_candidates, max_output)
+    except Exception as e:
+        logger.warning(
+            f"[rerank] LLM provider 不可用: {type(e).__name__}，回退到向量相似度排序"
+        )
+        return validate_rerank_recommendations([], top_candidates, max_output)
 
     clean = _strip_json_fence(llm_result.content)
 
     try:
         result = json.loads(clean)
         recommendations = result.get("recommendations", [])
-        logger.info(f"[recommend] LLM 精排成功: 返回 {len(recommendations)} 个推荐")
-        return recommendations[:max_output]
-    except json.JSONDecodeError:
+        validated = validate_rerank_recommendations(
+            recommendations, top_candidates, max_output
+        )
+        logger.info(
+            f"[recommend] LLM 精排成功: 原始 {len(recommendations) if isinstance(recommendations, list) else 0} 个，"
+            f"校验后 {len(validated)} 个推荐"
+        )
+        return validated
+    except (json.JSONDecodeError, AttributeError):
         logger.warning(f"[recommend] LLM 精排响应解析失败，回退到向量相似度排序")
-        fallback = []
-        for c in candidates_sorted[:max_output]:
-            fallback.append({"word": c["word"], "reason": "基于向量相似度推荐", "ai_generated": False})
-        return fallback
+        return validate_rerank_recommendations([], top_candidates, max_output)

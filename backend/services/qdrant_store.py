@@ -297,13 +297,15 @@ def list_local_tags(
 
 
 def count_local_tags(country: str = None, category: str = None, search: str = None) -> int:
-    """获取本地词库词条总数"""
+    """获取与列表接口相同筛选条件下的本地词库词条总数。"""
     client = get_qdrant_client()
     conditions = []
     if country:
         conditions.append(FieldCondition(key="country", match=MatchValue(value=country)))
     if category:
         conditions.append(FieldCondition(key="category", match=MatchValue(value=category)))
+    if search:
+        conditions.append(FieldCondition(key="word", match=MatchText(text=search)))
 
     filter_condition = Filter(must=conditions) if conditions else None
 

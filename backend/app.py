@@ -73,6 +73,54 @@ from services.retention import (
 )
 from services.transparency import transparency_payload
 
+
+def build_recommend_response(
+    recommendations: list[RecommendItem],
+    total_candidates: int,
+    filtered_candidates: int,
+) -> RecommendResponse:
+    """Build the versioned recommendation contract for every outcome."""
+    return RecommendResponse(
+        recommendations=recommendations,
+        total_candidates=total_candidates,
+        filtered_candidates=filtered_candidates,
+        ai_assisted=any(item.ai_generated for item in recommendations),
+        parameters_version=DISCLOSURE_VERSION,
+        disclosure_url="/v1/disclosure/parameters",
+    )
+
+
+def build_recommend_items(
+    recommendations: list[dict], candidates: list[dict]
+) -> list[RecommendItem]:
+    """Attach stored metadata and reject any non-candidate recommendation."""
+    candidate_by_word = {
+        candidate["word"].casefold(): candidate
+        for candidate in candidates
+        if isinstance(candidate.get("word"), str) and candidate["word"]
+    }
+    items: list[RecommendItem] = []
+    for recommendation in recommendations:
+        word = recommendation.get("word")
+        if not isinstance(word, str):
+            continue
+        candidate = candidate_by_word.get(word.casefold())
+        if candidate is None:
+            continue
+        items.append(RecommendItem(
+            word=candidate["word"],
+            reason=recommendation.get("reason") or "基于已入库候选标签推荐",
+            similarity=candidate.get("similarity"),
+            source=candidate.get("source"),
+            compliance_reason=(
+                candidate.get("compliance_reason") or candidate.get("reason")
+            ),
+            anchor_cn_word=candidate.get("anchor_cn_word"),
+            trend_score=candidate.get("trend_score", 0.0),
+            ai_generated=recommendation.get("ai_generated", True),
+        ))
+    return items
+
 # ==================== 审计装饰器（GDPR Art.5(2) 可责性，2026-08） ====================
 def _guard_rule_country(country: str, *, status: int = 400) -> str:
     """规则库国家防御校验：非法国家直接 4xx，不让 rule_manager 的 ValueError 穿成 500。
@@ -407,11 +455,7 @@ async def recommend_tags(request: Request, req: RecommendRequest,
 
     if not filtered:
         logger.info(f"[api] 标签推荐无候选结果: total={total_candidates}")
-        return RecommendResponse(
-            recommendations=[],
-            total_candidates=total_candidates,
-            filtered_candidates=filtered_count
-        )
+        return build_recommend_response([], total_candidates, filtered_count)
 
     # 4. LLM 精排
     recommendations = await rerank_tags_with_llm(
@@ -423,30 +467,10 @@ async def recommend_tags(request: Request, req: RecommendRequest,
     )
 
     # 5. 构造响应（补全相似度 + provenance 溯源解释字段，DSA Art.27 / AI Act Art.50）
-    word_to_candidate = {c["word"]: c for c in filtered}
-    items = []
-    for rec in recommendations:
-        cand = word_to_candidate.get(rec["word"], {})
-        items.append(RecommendItem(
-            word=rec["word"],
-            reason=rec["reason"],
-            similarity=cand.get("similarity"),
-            source=cand.get("source"),
-            compliance_reason=cand.get("compliance_reason") or cand.get("reason"),
-            anchor_cn_word=cand.get("anchor_cn_word"),
-            trend_score=cand.get("trend_score", 0.0),
-            ai_generated=rec.get("ai_generated", True),
-        ))
+    items = build_recommend_items(recommendations, filtered)
 
     logger.info(f"[api] 标签推荐完成: 返回 {len(items)} 个推荐")
-    return RecommendResponse(
-        recommendations=items,
-        total_candidates=total_candidates,
-        filtered_candidates=filtered_count,
-        ai_assisted=True,
-        parameters_version=DISCLOSURE_VERSION,
-        disclosure_url="/v1/disclosure/parameters",
-    )
+    return build_recommend_response(items, total_candidates, filtered_count)
 
 # ==================== 采集器触发接口 ====================
 @app.post("/admin/api/collect/overseas")
@@ -688,7 +712,7 @@ async def get_local_tags(
         offset=offset
     )
     items = [LocalTagItem(**item) for item in items_raw]
-    total = count_local_tags(country=country, category=category)
+    total = count_local_tags(country=country, category=category, search=search)
     # 返回整数偏移作为 next_offset（兼容前端）
     return LocalTagListResponse(count=len(items), total_count=total, items=items, next_offset=next_offset)
 

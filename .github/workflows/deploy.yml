@@ -19,3 +19,5 @@ jobs:
           python-version: '3.11'
       - run: pip install -r requirements.txt
       - run: python -m compileall .
+      - run: python -c "import app"
+      - run: python -m unittest discover -s tests -v

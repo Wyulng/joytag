@@ -44,7 +44,10 @@ huggingface_cache/
 # OS
 .DS_Store
 Thumbs.db
-backend/models/
+
+# Local embedding weights are runtime assets; API contract sources under
+# backend/models/ must remain tracked.
+backend/models/bge-small-zh-v1.5/
 
 # Local agent instructions
 /AGENTS.md
