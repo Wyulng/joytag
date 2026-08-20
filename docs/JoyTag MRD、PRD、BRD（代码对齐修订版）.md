@@ -218,31 +218,116 @@ LLM 返回的词必须来自候选集。非法词、重复词或格式错误会�
 
 ## 3.3 技术架构
 
-| 层 | 当前选型 | 说明 |
+JoyTag 当前采用“采集与对齐—合规决策—向量存储—推荐输出”的分层架构。MVP 重点是用较少的基础设施验证词库建设、规则沉淀和推荐 API 闭环；Ops 上架组件、消费者搜索接入和 SaaS 化能力仍属于后续产品化范围。
+
+### 3.3.1 总体架构
+
+```mermaid
+flowchart LR
+    A[淘宝搜索建议] --> B[中文锚点采集]
+    C[Amazon 搜索建议] --> D[海外词采集]
+    E[eBay 搜索建议] --> D
+    B --> F[本地 Embedding]
+    D --> G[翻译与锚点检索]
+    G --> H[规则检查]
+    H --> I[LLM 合规评估]
+    I --> J[local_tags]
+    I --> K[pending_review]
+    H --> L[blocked_decisions]
+    F --> M[(Qdrant)]
+    J --> M
+    K --> M
+    L --> M
+    N[商品标题/类目/国家] --> O[Embedding]
+    O --> M
+    M --> P[Top-16 召回]
+    P --> Q[类目过滤]
+    Q --> R[LLM Top-8 精排]
+    R --> S[推荐 API]
+```
+
+### 3.3.2 技术组件选型
+
+| 层 | 当前选型 | 当前实现说明 |
 | --- | --- | --- |
-| Backend | Python 3.11 + FastAPI + Uvicorn | 异步 API 与调度 |
-| 管理 UI | 静态 HTML + 原生 JavaScript | 内嵌单页，无前端构建链 |
-| 向量库 | Qdrant 1.9.0 | 四个集合，确定性 ID |
-| Embedding | 本地 `BAAI/bge-small-zh-v1.5` | 512 维；模型权重不进入 Git |
-| LLM | provider 适配层 | 默认 DeepSeek/OpenAI-compatible；可配置 Azure/Bedrock |
-| 合规数据库 | PostgreSQL 16 | audit、trace、lineage、DSAR、retention |
-| 身份 | Keycloak 24.0.5 | OIDC、RBAC、TOTP、服务 scope |
-| 调度 | APScheduler 3.x | 采集任务与每日留存清理 |
+| Backend | Python 3.11 + FastAPI + Uvicorn | 异步 API、采集触发、管理路由和生命周期管理 |
+| 管理 UI | 静态 HTML + 原生 JavaScript | 内嵌单页，无 React、无前端构建链、无独立前端服务 |
+| 中文数据源 | 淘宝搜索建议 | 用于中文锚点采集；当前不描述为六国语言合规评估流程 |
+| 海外数据源 | Amazon completion + eBay autosuggest | Amazon 为主源，eBay 为辅助源 |
+| Embedding | 本地 `BAAI/bge-small-zh-v1.5` | 512 维；优先从 `backend/models/bge-small-zh-v1.5/` 加载，模型权重不进入 Git |
+| LLM | provider 适配层 | 默认 DeepSeek 的 OpenAI-compatible 接口，可配置 Azure 和 Bedrock |
+| 向量库 | Qdrant 1.9.0 | 四个集合、余弦距离、确定性 ID、payload 保存 provenance |
+| 合规数据库 | PostgreSQL 16 | audit、llm_trace、lineage、DSAR 和 retention 数据 |
+| 身份与权限 | Keycloak 24.0.5 | OIDC、RBAC、TOTP、服务间 scope 和会话 CSRF |
+| 调度 | APScheduler 3.x | 采集任务、手动运行和每日留存清理 |
+
+### 3.3.3 数据采集与语义处理流程
+
+**中文锚点流程**：淘宝搜索建议采集中文长尾词，按位置评分、去重并结合进度文件跳过已处理词，随后用本地 Embedding 写入 `cn_anchors`。中文锚点主要承担跨语言对齐的底座作用，不在当前流程中虚构六国语言逐词合规评估结果。
+
+**海外标签流程**：
+
+```text
+最新中文锚点生成六国种子
+    -> Amazon completion 与 eBay autosuggest 按国家采集
+    -> 跨源去重、国家配额合并和来源透传
+    -> 海外词翻译为中文
+    -> 中文锚点向量检索
+    -> 国家规则与 UCPD 内置规则检查
+    -> LLM 合规评估
+    -> local_tags / pending_review / blocked_decisions
+```
+
+该流程中的每条词都保留 `source_type`、`collection_run_id`、`collected_at` 等来源信息。LLM 参与翻译、合规评估以及后续推荐理由和排序生成；最终写入推荐池的标签必须来自已入库的结构化词条，不允许由 LLM 直接生成未入库词。
+
+**合规漏斗**：
+
+1. 安全词列表命中时直接通过，不再重复调用 LLM；
+2. 国家禁用词和 UCPD Annex I 内置规则命中时硬拦截，并将决策写入 `blocked_decisions`；
+3. 未命中规则的词进入 LLM 评估，结果分为“可复用”“存疑”和“需拦截”；
+4. “存疑”词进入 `pending_review`，人工通过后写入安全规则和 `local_tags`，拒绝后沉淀为拦截规则。
+
+**隐私边界**：当前 Embedding 在本地完成，不把商品标题发送给 Embedding 服务；LLM 调用前复用 Presidio regex-only 假名化，日志和 LLM trace 只保存哈希、token 类型映射及必要的审计信息。
+
+### 3.3.4 推荐链路
+
+1. 接收商品标题、目标国家、可选类目和 `top_k`；
+2. 使用同一套本地 Embedding 模型生成查询向量；
+3. 在 Qdrant 中按国家和 `compliance_status=可复用` 过滤，召回最多 16 个候选；
+4. 应用层执行类目过滤；
+5. 将最多 8 个候选交给 LLM 精排；
+6. LLM 只能从候选集合中选择词条，非法词、重复词和格式错误结果会被丢弃；
+7. LLM 不可用或响应解析失败时，按向量相似度顺序回退；
+8. 默认返回最多 5 条，接口允许 `top_k=1—10`。
+
+### 3.3.5 运行、认证与合规控制
+
+- 管理端 `/admin` 通过 Keycloak OIDC 登录，角色分为 `admin`、`reviewer` 和 `operator`；
+- 推荐服务间调用使用 Bearer token 和 `joytag:recommend` scope；
+- 管理写操作要求 CSRF 双提交校验，并通过 hash-chain 审计记录操作者、动作和资源；
+- LLM 调用保存 prompt 哈希、PII token 映射和词条哈希，采集任务保存 lineage 事件；
+- DSAR 支持跨 Qdrant、LLM trace、lineage 和 audit 数据检索及擦除；
+- `transparency.py`、`/v1/disclosure/parameters` 和公开透明度页面共用版本化披露内容；
+- 生产必须备份 Qdrant 词库卷和 PostgreSQL 审计证据，Embedding 模型缓存可以重建但不能替代业务数据备份。
 
 ## 3.4 Qdrant 数据模型
 
-| 集合 | 向量 | 目的 |
-| --- | --- | --- |
-| `cn_anchors` | 512 维 Embedding | 中文锚点库 |
-| `local_tags` | 512 维 Embedding | 推荐唯一标签来源 |
-| `pending_review` | 512 维零向量 | 人工待审核队列 |
-| `blocked_decisions` | 512 维零向量 | 被拦截词与决策证据 |
+当前四个集合使用 512 维余弦向量。`pending_review` 和 `blocked_decisions` 不参与语义检索，但使用零向量作为 Qdrant 点位占位，以便统一保存和分页管理。
+
+| 集合 | 向量 | 目的 | 主要 payload |
+| --- | --- | --- | --- |
+| `cn_anchors` | 512 维本地 Embedding | 中文锚点库，不直接作为对外标签输出 | `cn_word`、`category`、来源和采集批次 |
+| `local_tags` | 512 维本地 Embedding | 推荐唯一标签来源 | `word`、`country`、合规状态、来源、趋势分、中文锚点 |
+| `pending_review` | 512 维零向量 | 人工待审核队列 | 词条、国家、审核理由、规则和 provenance |
+| `blocked_decisions` | 512 维零向量 | 被拦截词与决策证据 | 词条、国家、理由、rule_id、来源和 trace |
+
+所有自然键使用确定性 UUID：中文锚点按 `cn_word` 生成，标签和审核记录按 `word + country` 生成。词条的向量、业务字段和合规字段分开保存，删除或 DSAR 擦除时可以按记录 ID 处理完整链路。
 
 ## 3.5 主要 API 契约
 
 | 方法与路径 | 访问控制 | 用途 |
 | --- | --- | --- |
-| `POST /v1/tag/recommend` | Bearer + `joytag:recommend` | 标签推荐 |
+| `POST /v1/tag/recommend` | Bearer + `joytag:recommend` | 标签推荐；限流 20/min |
 | `GET /v1/disclosure/parameters` | 公开 | 推荐参数披露 |
 | `GET /v1/transparency` | 公开 | 透明度 JSON |
 | `POST /v1/dsar/request` | 公开、5/hour | DSAR 受理 |
@@ -258,22 +343,22 @@ LLM 返回的词必须来自候选集。非法词、重复词或格式错误会�
 | `/admin/api/dsar/*` | admin | DSAR 检索与擦除 |
 | `/admin/api/retention/*` | admin | 留存配置与清理 |
 
-OpenAPI `/docs` 是请求和响应字段的机器可读权威来源。
+OpenAPI `/docs` 和受版本控制的 `backend/models/schemas.py` 是请求和响应字段的权威来源。
 
 ## 3.6 推荐响应示意
 
-示例仅说明字段，不保证任何固定标签、候选数或相似度：
+示例只说明当前响应字段，不保证固定标签、固定词条数量、固定相似度或固定时延：
 
 ```json
 {
   "recommendations": [
     {
-      "word": "示例候选标签",
-      "reason": "与标题和类目匹配",
+      "word": "已入库候选标签",
+      "reason": "由向量召回和候选集内精排得到",
       "similarity": 0.86,
       "source": "amazon_suggest",
       "compliance_reason": "通过规则与评估",
-      "anchor_cn_word": "示例中文锚点",
+      "anchor_cn_word": "已入库中文锚点",
       "trend_score": 0.74,
       "ai_generated": true
     }
@@ -281,35 +366,40 @@ OpenAPI `/docs` 是请求和响应字段的机器可读权威来源。
   "total_candidates": 16,
   "filtered_candidates": 8,
   "ai_assisted": true,
-  "parameters_version": "版本号",
+  "parameters_version": "当前披露版本",
   "disclosure_url": "/v1/disclosure/parameters"
 }
 ```
 
-空结果仍返回 `recommendations=[]`、真实候选计数、`ai_assisted=false`、版本号和披露地址。
+`word` 必须来自已召回的候选集合。`ai_generated=true` 仅表示该条经过 LLM 精排或生成推荐理由，不表示生成了新的词条。空结果仍返回 `recommendations=[]`、真实候选计数、`ai_assisted=false`、参数版本号和披露地址。
 
 ## 3.7 MVP 演示与验收
 
-演示不依赖固定词条数量、固定示例词或预设时延范围。结果取决于网络、外部建议接口、LLM、Embedding 模型加载、已有词库和人工审核状态。
+演示基于当前 FastAPI、Qdrant、PostgreSQL、Keycloak 和 LLM provider 配置。结果会受到外部搜索建议接口、LLM、Embedding 模型、已有词库、网络和人工审核状态影响，不承诺固定词条数量、固定示例词或预设时延。
 
 建议演示顺序：
 
-1. 登录 `/admin`，确认角色与九个管理页签。
-2. 调用 `POST /admin/api/collect/cn`，观察中文锚点采集与 lineage。
-3. 调用 `POST /admin/api/collect/overseas`，观察 Amazon/eBay 来源和三级分流。
-4. 在后台查看 `local_tags`、`pending_review`、`blocked_decisions` 和规则。
-5. 审核一条存疑词，验证标签/规则变化与审计记录。
-6. 调用 `POST /v1/tag/recommend`，核对候选约束、provenance、AI 标识和披露地址。
-7. 模拟 LLM 不可用，验证向量排序回退且 `ai_assisted=false`。
-8. 访问参数披露、透明度页和 DSAR 受理接口。
+1. 启动 Qdrant、PostgreSQL、Keycloak 和 Backend，访问 `/health`；
+2. 登录 `/admin`，确认角色权限和九个管理页签；
+3. 调用 `POST /admin/api/collect/cn`，观察淘宝建议词写入 `cn_anchors` 及 lineage；
+4. 调用 `POST /admin/api/collect/overseas`，观察 Amazon/eBay 来源、翻译、规则分流以及 `local_tags`、`pending_review`、`blocked_decisions` 的变化；
+5. 在待审核页通过或拒绝一条词，验证规则库、Qdrant 记录和审计链同步更新；
+6. 调用 `POST /v1/tag/recommend`，核对候选集约束、provenance、AI 标识、相似度和披露地址；
+7. 模拟 LLM 不可用，验证接口仍按向量相似度回退，且 `ai_assisted=false`；
+8. 访问参数披露、透明度页面和 DSAR 受理接口。
+
+当前技术演示使用本地 `BAAI/bge-small-zh-v1.5` 进行向量化，使用 LLM provider 进行翻译、合规判断和精排；演示数据以运行时实际采集、已有词库和审核结果为准。
 
 ## 3.8 非功能要求
 
-- **可用性**：外部 LLM 精排失败时返回向量排序结果；采集器按国家回退固定种子。
-- **安全性**：生产必须启用认证、强密钥、TLS 和网络边界；管理写操作必须带 CSRF 与角色检查。
-- **可追溯性**：数据源、采集批次、模型调用、规则与人工操作可关联查询。
-- **可维护性**：API 契约集中在受版本控制的 `backend/models/schemas.py`；CI 必须执行 `import app` 和契约测试。
-- **数据恢复**：生产必须备份 Qdrant 与 Postgres；模型缓存可重建，业务词库和审计证据不可仅靠源码恢复。
+- **可用性**：LLM 精排失败时返回向量排序结果；海外采集按国家处理异常并使用既有种子回退；
+- **一致性**：中文锚点、标签和查询必须使用同一 512 维 Embedding 空间，不能混用不同模型产生的向量；
+- **安全性**：生产必须启用认证、强密钥、TLS 和网络边界；管理写操作必须带 CSRF 与角色检查；
+- **合规性**：词条来源、规则命中、LLM 评估、人工操作和拦截决策均需保留可关联证据；
+- **可追溯性**：数据源、采集批次、模型调用、规则与人工操作可以通过 provenance、trace、lineage 和审计链关联查询；
+- **可维护性**：API 契约集中在受版本控制的 `backend/models/schemas.py`；CI 执行 `import app` 和契约测试；
+- **性能边界**：推荐链路采用 top-16 向量召回、类目过滤和最多 top-8 LLM 精排，最终默认返回最多 5 个结果；
+- **数据恢复**：生产必须备份 Qdrant 与 Postgres；模型缓存可重建，业务词库、规则文件和审计证据不可仅靠源码恢复。
 
 ## 3.9 当前不在范围内
 
