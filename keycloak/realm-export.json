@@ -51,7 +51,7 @@
       "redirectUris": [
         "http://localhost:8000/*",
         "http://localhost:8001/*",
-        "http://<你的服务器地址>:8001/*"
+        "http://localhost:8001/*"
       ],
       "webOrigins": [ "+" ],
       "attributes": {
