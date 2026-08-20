@@ -79,7 +79,8 @@ services:
       - KC_HOSTNAME_STRICT=false
       - KC_PROXY=edge
     volumes:
-      - ./keycloak/import:/opt/keycloak/data/import:ro
+      # Mount the tracked export directly; a fresh clone must not depend on an untracked import directory.
+      - ./keycloak/realm-export.json:/opt/keycloak/data/import/realm-export.json:ro
     depends_on:
       postgres:
         condition: service_healthy
@@ -111,7 +112,7 @@ services:
       - DATABASE_URL=postgresql://joytag:${JOYTAG_DB_PASSWORD:?JOYTAG_DB_PASSWORD 必填（.env）}@postgres:5432/joytag
       # Keycloak SSO：外部地址给浏览器/iss 校验，内部地址给 token 兑换/JWKS
       - AUTH_ENABLED=true
-      - OIDC_ISSUER=${OIDC_ISSUER:-http://<你的服务器地址>:8080/realms/joytag}
+      - OIDC_ISSUER=${OIDC_ISSUER:-http://localhost:8080/realms/joytag}
       - OIDC_JWKS_URL=${OIDC_JWKS_URL:-http://keycloak:8080/realms/joytag/protocol/openid-connect/certs}
       - OIDC_TOKEN_URL=${OIDC_TOKEN_URL:-http://keycloak:8080/realms/joytag/protocol/openid-connect/token}
       - SESSION_SECRET=${SESSION_SECRET:?SESSION_SECRET 必填（.env，openssl rand -hex 32 生成）}
@@ -119,8 +120,12 @@ services:
       - ./backend:/app
       - huggingface_cache:/home/appuser/.cache/huggingface/hub
     depends_on:
-      - qdrant
-      - postgres
+      qdrant:
+        condition: service_started
+      postgres:
+        condition: service_healthy
+      keycloak:
+        condition: service_started
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
       interval: 30s

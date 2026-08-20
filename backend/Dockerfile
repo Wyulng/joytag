@@ -6,10 +6,9 @@ WORKDIR /app
 RUN groupadd -r appuser && useradd -r -g appuser appuser
 
 COPY requirements.txt .
-# BuildKit cache mount: pip wheels persist on host across builds —
-# requirements changes trigger reinstall but no re-download.
-RUN --mount=type=cache,target=/root/.cache/pip \
-    pip install -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple --timeout 120
+# Keep the image compatible with docker-compose v1.29.2 and classic Docker builders.
+# The requirements file pins a CPU Torch wheel so a CPU server does not pull CUDA runtimes.
+RUN pip install --no-cache-dir -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple --timeout 120
 
 EXPOSE 8000
 
