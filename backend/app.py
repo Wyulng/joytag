@@ -51,7 +51,10 @@ from services.recommend import (
     retrieve_candidate_tags, rerank_tags_with_llm, filter_candidates_by_category,
     TOP_K_RECALL, RERANK_DEPTH,
 )
-from services.task_scheduler import init_scheduler, shutdown_scheduler, add_job, remove_job, reschedule, run_job_now
+from services.task_scheduler import (
+    init_scheduler, shutdown_scheduler, add_job, remove_job, reschedule,
+    run_job_now, validate_cron,
+)
 from services.scheduler_store import list_schedules, add_schedule, delete_schedule, update_schedule, get_schedule
 from services.http_client import close_http_client
 from services.db import init_db
@@ -523,6 +526,10 @@ async def create_schedule(
     """创建新定时任务"""
     if task_type not in ("cn", "overseas"):
         raise HTTPException(status_code=400, detail="task_type must be 'cn' or 'overseas'")
+    try:
+        validate_cron(cron)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     schedule = add_schedule(name=name, task_type=task_type, cron=cron)
     add_job(schedule)
     return {"success": True, "schedule": schedule.to_dict()}
@@ -548,6 +555,11 @@ async def update_schedule_api(schedule_id: str, req: UpdateScheduleRequest, requ
                               _csrf=Depends(require_csrf)):
     """更新定时任务（启用/禁用/修改cron）"""
     payload = req.model_dump(exclude_none=True)
+    if "cron" in payload:
+        try:
+            validate_cron(payload["cron"])
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
     schedule = update_schedule(schedule_id, **payload)
     if not schedule:
         raise HTTPException(status_code=404, detail="任务不存在")
