@@ -2,11 +2,25 @@ import unittest
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from services import alignment
-from services.embedding import EMBEDDING_DIM, get_embedding
+from services.embedding import EMBEDDING_DIM, _repair_position_ids, get_embedding
 from services.qdrant_store import VECTOR_SIZE, insert_pending_review, upsert_cn_anchor
 
 
 class EmbeddingMigrationTests(unittest.IsolatedAsyncioTestCase):
+    def test_gte_position_ids_are_restored_when_loader_leaves_garbage(self):
+        import torch
+
+        embeddings = MagicMock()
+        embeddings.position_ids = torch.tensor([91, -7, 12, 44], dtype=torch.long)
+        auto_model = MagicMock(embeddings=embeddings)
+        transformer = MagicMock(auto_model=auto_model)
+        model = MagicMock()
+        model._first_module.return_value = transformer
+
+        _repair_position_ids(model)
+
+        self.assertEqual(embeddings.position_ids.tolist(), [0, 1, 2, 3])
+
     async def test_embedding_is_normalized_and_768_dimensions(self):
         encoded = MagicMock()
         encoded.tolist.return_value = [0.125] * EMBEDDING_DIM
@@ -17,6 +31,7 @@ class EmbeddingMigrationTests(unittest.IsolatedAsyncioTestCase):
             vector = await get_embedding("winter coat")
 
         self.assertEqual(len(vector), 768)
+        self.assertAlmostEqual(sum(value * value for value in vector) ** 0.5, 1.0)
         model.encode.assert_called_once_with(
             "winter coat",
             normalize_embeddings=True,
