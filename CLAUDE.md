@@ -12,7 +12,7 @@ Joytag is a localized long-tail tag recommendation system for Joybuy's EU market
 
 - **Backend**: Python 3.11 + FastAPI + Uvicorn (async, hot-reload enabled)
 - **Vector DB**: Qdrant v1.9.0 (4 collections: `cn_anchors`, `local_tags`, `pending_review`, `blocked_decisions`)
-- **Embedding**: BAAI/bge-small-zh-v1.5 (512-dim) via local sentence-transformers. 模型优先从 `backend/models/bge-small-zh-v1.5/`（gitignore，不随 git 走）加载，目录不存在才回退 HF Hub 名称——hf-mirror 大文件 302 到 AWS CDN（xet-bridge）国内不通，**获取模型用 ModelScope**：`pip install modelscope` 后 `python -c "from modelscope.hub.snapshot_download import snapshot_download; snapshot_download('AI-ModelScope/bge-small-zh-v1.5', local_dir='backend/models/bge-small-zh-v1.5')"`（生产换服务器时需单独传此目录）
+- **Embedding**: `Alibaba-NLP/gte-multilingual-base` (768-dim) via local sentence-transformers，默认 CPU、归一化输出。模型优先从 `backend/models/gte-multilingual-base/`（gitignore，不随 git 走）加载，目录不存在才回退固定 HF revision；**获取模型用 ModelScope**：`pip install modelscope` 后 `python -c "from modelscope.hub.snapshot_download import snapshot_download; snapshot_download('iic/gte_sentence-embedding_multilingual-base', local_dir='backend/models/gte-multilingual-base')"`（生产换服务器时需单独传此目录）。
 - **LLM**: provider 适配层（`services/llm_provider.py`）：默认 DeepSeek（OpenAI 兼容），env 切换 Mistral/OpenAI/Azure/Bedrock（EU 切换 = 纯配置变更）。发送前 Presidio 假名化（`services/pii_guard.py`，regex-only 模式）。
 - **Compliance DB**: Postgres 16（`services/db.py`）：audit_log（hash-chain）/ llm_trace / lineage_event / dsar_request / retention_policy / audit_chain_head
 - **Auth**: Keycloak 24.0.5（OIDC 授权码 + PKCE，服务端会话 cookie，RBAC 角色 admin/reviewer/operator，强制 TOTP）；`services/auth.py` 同时作资源服务器（JWKS 验 JWT，scope `joytag:recommend`）
@@ -61,13 +61,13 @@ backend/
   models/schemas.py          # Pydantic models for all request/response types
   services/
     __init__.py              # Empty
-    qdrant_store.py          # Qdrant CRUD: 4 collections, deterministic UUIDs (length-prefixed MD5), VECTOR_SIZE=512
-    embedding.py             # Local sentence-transformers BAAI/bge-small-zh-v1.5, via asyncio.to_thread
+    qdrant_store.py          # Qdrant CRUD: 4 collections, deterministic UUIDs (length-prefixed MD5), VECTOR_SIZE=768
+    embedding.py             # Local sentence-transformers multilingual GTE, via asyncio.to_thread
     llm.py                   # 合规评估/翻译：规则库优先 → LLM（假名化 + 留痕 + 重试 3× exp backoff）
     llm_provider.py          # LLM provider 适配层：OpenAICompat/Azure/Bedrock（SigV4，无 boto3），LLM_PROVIDER env 选择
     pii_guard.py             # Presidio 假名化（regex-only）：pseudonymize(text) -> (clean_text, {token: type})
     recommend.py             # 2-stage: async vector search (top-16) + LLM rerank (top-5)，假名化 + 留痕
-    alignment.py             # Per-word orchestration: 翻译 → 锚点检索 → 规则/LLM 评估 → upsert / pending / blocked_decisions
+    alignment.py             # Per-word orchestration: 多语言锚点检索 → 规则/LLM 评估 → upsert / pending / blocked_decisions
     rule_manager.py          # Country banned/safe word lists (JSON files + TTL cache + FileLock) + UCPD 内置种子
     db.py                    # Postgres 连接池（psycopg3）+ 幂等 DDL + 默认留存策略种子
     audit.py                 # hash-chain 审计（CloudTrail 模式）：record_event/verify_chain/list_audit/redact_audit_for_erasure
@@ -106,7 +106,7 @@ docs/
 
 ### Key Data Flows
 
-1. **Overseas Collection**: **逐国家流水线**（翻译与抓取重叠，种子阶段 90s 上限，超时/异常该国回退固定种子）——动态种子（cn_anchors 最新 50 词 → LLM 批量翻译六国语言，增量缓存）-> Amazon completion (六国站点) + eBay autosug 双源并行 -> 逐国配额合并（15 Amazon + 5 eBay，casefold 跨源去重）-> LLM translation -> CN anchor vector search (threshold 0.75) -> 规则硬拦截（含 UCPD 内置种子）-> LLM compliance assessment -> `local_tags` / `pending_review` / **`blocked_decisions`（拦截决策持久化，不再丢弃）**
+1. **Overseas Collection**: **逐国家流水线**（种子翻译与抓取重叠，种子阶段 90s 上限，超时/异常该国回退固定种子）——动态种子（cn_anchors 最新 50 词 → LLM 批量翻译六国语言，增量缓存）-> Amazon completion (六国站点) + eBay autosug 双源并行 -> 逐国配额合并（15 Amazon + 5 eBay，casefold 跨源去重）-> category-filtered GTE multilingual CN anchor vector search (default threshold 0.60; uncategorized 0.75) -> 规则硬拦截（含 UCPD 内置种子）-> LLM compliance assessment -> `local_tags` / `pending_review` / **`blocked_decisions`（拦截决策持久化，不再丢弃）**
 2. **CN Anchor Collection**: Taobao search suggestion API (80+ seed categories) -> position-based scoring -> top 200 -> `cn_anchors`
 3. **Tag Recommendation**: product title -> embedding -> Qdrant vector search (filtered by country + `compliance_status=="可复用"`) -> LLM rerank (top-16 -> top-8 -> top-5)
 4. **全部词条带 provenance**（source_type/collection_run_id/collected_at）+ 采集 run_id 血缘事件（lineage START/COMPLETE/FAIL + 词级 OUTPUT）
@@ -115,10 +115,10 @@ docs/
 
 | Collection | Vector | ID Generation | Purpose |
 |-----------|--------|---------------|---------|
-| `cn_anchors` | 512-dim (bge-small-zh-v1.5) | MD5(cn_word) | Chinese anchor words |
-| `local_tags` | 512-dim (bge-small-zh-v1.5) | MD5(word + country) | Final localized tags |
-| `pending_review` | 512-dim (zero vector) | MD5(word + country) | Words needing human review |
-| `blocked_decisions` | 512-dim (zero vector) | MD5(word + country) | 被拦截词决策留痕（UCPD/GDPR 举证，2026-08 新增） |
+| `cn_anchors` | 768-dim (gte-multilingual-base) | MD5(cn_word) | Chinese anchor words |
+| `local_tags` | 768-dim (gte-multilingual-base) | MD5(word + country) | Final localized tags |
+| `pending_review` | 768-dim (zero vector) | MD5(word + country) | Words needing human review |
+| `blocked_decisions` | 768-dim (zero vector) | MD5(word + country) | 被拦截词决策留痕（UCPD/GDPR 举证，2026-08 新增） |
 
 All deterministic UUIDs via `_generate_deterministic_id(*parts)` in `qdrant_store.py`. Uses length-prefixed encoding (`f"{len(p)}:{p}"`) instead of colon-joining to avoid collisions when word values contain colons.
 
@@ -228,7 +228,7 @@ Both collectors persist progress to JSON files using dict-keys (insertion order)
 
 ### CN vs Overseas Data Flow
 - **CN anchors**: `cn_ecommerce.py` (Taobao API, JD 已移除) → `cn_longtail.py` (dedup via `cn_anchor_exists` DB check, run_id + lineage) → `alignment.py` (embed + upsert to `cn_anchors` with provenance)
-- **Overseas tags**: `seed_builder.py` (动态种子) + `amazon_suggest.py`/`ebay_suggest.py` (Amazon completion + eBay autosug 双源) → `overseas_trends.py` (逐国配额合并 + dedup via `local_tag_exists` DB check, granular source 透传 amazon_suggest/ebay_suggest) → `alignment.py` (translate → find CN anchor → rules/LLM assess → `local_tags` / `pending_review` / `blocked_decisions`)
+- **Overseas tags**: `seed_builder.py` (动态种子) + `amazon_suggest.py`/`ebay_suggest.py` (Amazon completion + eBay autosug 双源) → `overseas_trends.py` (逐国配额合并 + dedup via `local_tag_exists` DB check, granular source 透传 amazon_suggest/ebay_suggest) → `alignment.py` (direct multilingual CN anchor search → rules/LLM assess → `local_tags` / `pending_review` / `blocked_decisions`)
 
 ### Audit（hash-chain，2026-08）
 - `@audited(action, resource_type, ...)` 装饰器挂全部管理变更端点（app.py）。变更成功后才写审计；**审计写入失败 → 500**（可责性优先：操作已执行但无法举证时立即告警——消息明示"已执行但审计失败"，非静默）。

@@ -73,7 +73,7 @@ async def process_overseas_word(word: str, country: str, anchor_cn_id: str = Non
     }
     # 第0步：直接使用多语言向量查找中文锚点，避免每个海外词额外调用翻译 LLM
     query_vector = await get_embedding(word)
-    anchor_info = search_cn_anchor_by_word(word, query_vector, score_threshold=0.75)
+    anchor_info = search_cn_anchor_by_word(word, query_vector, category=category)
 
     resolved_anchor_cn_id = anchor_info["id"] if anchor_info else None
     resolved_cn_word = anchor_info["cn_word"] if anchor_info else None

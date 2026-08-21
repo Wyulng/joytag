@@ -30,6 +30,16 @@ EMBEDDING_MODEL_REVISION = os.getenv(
 EMBEDDING_NORMALIZED = os.getenv("EMBEDDING_NORMALIZE", "true").strip().lower() not in {
     "0", "false", "no", "off"
 }
+ANCHOR_MATCH_THRESHOLD = float(os.getenv("ANCHOR_MATCH_THRESHOLD", "0.60"))
+ANCHOR_MATCH_UNCATEGORIZED_THRESHOLD = float(
+    os.getenv("ANCHOR_MATCH_UNCATEGORIZED_THRESHOLD", "0.75")
+)
+for threshold_name, threshold_value in (
+    ("ANCHOR_MATCH_THRESHOLD", ANCHOR_MATCH_THRESHOLD),
+    ("ANCHOR_MATCH_UNCATEGORIZED_THRESHOLD", ANCHOR_MATCH_UNCATEGORIZED_THRESHOLD),
+):
+    if not 0.0 <= threshold_value <= 1.0:
+        raise ValueError(f"{threshold_name} must be between 0.0 and 1.0")
 
 _client = None
 
@@ -564,15 +574,35 @@ def delete_pending_review(point_id: str) -> bool:
     )
     logger.info(f"[qdrant] 删除待审核记录: {point_id}")
     return True
-def search_cn_anchor_by_word(query_text: str, vector: list[float], score_threshold: float = 0.75) -> dict | None:
+def search_cn_anchor_by_word(
+    query_text: str,
+    vector: list[float],
+    score_threshold: float | None = None,
+    category: str | None = None,
+) -> dict | None:
     """
-    通过多语言向量相似度在 cn_anchors 中查找中文锚点。
+    通过多语言向量相似度在 cn_anchors 中查找中文锚点。有类目时仅在同类目
+    锚点中检索并使用跨语言阈值；无类目时使用更严格阈值，降低短词误配风险。
     返回找到的锚点记录（含 id, cn_word），未找到或相似度低于阈值时返回 None。
     """
+    effective_threshold = score_threshold
+    if effective_threshold is None:
+        effective_threshold = (
+            ANCHOR_MATCH_THRESHOLD
+            if category
+            else ANCHOR_MATCH_UNCATEGORIZED_THRESHOLD
+        )
+    category_filter = None
+    if category:
+        category_filter = Filter(
+            must=[FieldCondition(key="category", match=MatchValue(value=category))]
+        )
+
     client = get_qdrant_client()
     results = client.search(
         collection_name=ANCHOR_COLLECTION,
         query_vector=vector,
+        query_filter=category_filter,
         limit=1,
         with_payload=True,
         with_vectors=False
@@ -581,8 +611,11 @@ def search_cn_anchor_by_word(query_text: str, vector: list[float], score_thresho
         logger.debug(f"[qdrant] 未找到中文锚点: {query_text}")
         return None
     best = results[0]
-    if best.score < score_threshold:
-        logger.debug(f"[qdrant] 中文锚点相似度不足: {query_text} (score={best.score:.3f} < {score_threshold})")
+    if best.score < effective_threshold:
+        logger.debug(
+            f"[qdrant] 中文锚点相似度不足: {query_text} "
+            f"(score={best.score:.3f} < {effective_threshold}, category={category})"
+        )
         return None
     logger.info(f"[qdrant] 找到中文锚点: {best.payload.get('cn_word')} (score={best.score:.3f})")
     return {

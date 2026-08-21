@@ -10,8 +10,8 @@ from pydantic import BaseModel, Field, field_validator
 
 
 # Versioned public contracts. Bump these when the disclosed behavior changes.
-DISCLOSURE_VERSION = "2026-08-15"
-TRANSPARENCY_VERSION = "2026-08-15"
+DISCLOSURE_VERSION = "2026-08-21"
+TRANSPARENCY_VERSION = "2026-08-21"
 
 DSAR_REQUEST_TYPES = ("access", "erasure", "objection")
 DSAR_CONTACT_MIN_LENGTH = 3

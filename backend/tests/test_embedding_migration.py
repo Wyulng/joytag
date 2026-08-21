@@ -1,9 +1,15 @@
 import unittest
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from services import alignment
 from services.embedding import EMBEDDING_DIM, _repair_position_ids, get_embedding
-from services.qdrant_store import VECTOR_SIZE, insert_pending_review, upsert_cn_anchor
+from services.qdrant_store import (
+    VECTOR_SIZE,
+    insert_pending_review,
+    search_cn_anchor_by_word,
+    upsert_cn_anchor,
+)
 
 
 class EmbeddingMigrationTests(unittest.IsolatedAsyncioTestCase):
@@ -46,7 +52,7 @@ class EmbeddingMigrationTests(unittest.IsolatedAsyncioTestCase):
                 alignment,
                 "search_cn_anchor_by_word",
                 return_value={"id": "anchor-1", "cn_word": "冬季外套", "score": 0.91},
-            ),
+            ) as search_anchor,
             patch.object(alignment, "assess_single", new=AsyncMock(return_value=("可复用", "通过", None, None))),
             patch.object(alignment, "upsert_local_tag", return_value="tag-1") as upsert,
             patch.object(alignment, "_record_word_lineage"),
@@ -54,16 +60,54 @@ class EmbeddingMigrationTests(unittest.IsolatedAsyncioTestCase):
             result = await alignment.process_overseas_word(
                 word="winter coat",
                 country="DE",
+                category="服装",
                 source="amazon_suggest",
             )
 
         embed.assert_awaited_once_with("winter coat")
+        search_anchor.assert_called_once_with("winter coat", vector, category="服装")
         self.assertEqual(upsert.call_args.kwargs["vector"], vector)
         self.assertEqual(result["anchor_cn_word"], "冬季外套")
         self.assertNotIn("translate_foreign_to_chinese", alignment.__dict__)
 
 
 class QdrantEmbeddingMetadataTests(unittest.TestCase):
+    def test_multilingual_anchor_threshold_accepts_cross_language_match(self):
+        client = MagicMock()
+        client.search.return_value = [
+            SimpleNamespace(
+                id="anchor-1",
+                score=0.641,
+                payload={"cn_word": "冬季外套"},
+            )
+        ]
+        with patch("services.qdrant_store.get_qdrant_client", return_value=client):
+            result = search_cn_anchor_by_word(
+                "winter coat", [0.0] * VECTOR_SIZE, category="服装"
+            )
+
+        self.assertEqual(result["cn_word"], "冬季外套")
+        query_filter = client.search.call_args.kwargs["query_filter"]
+        self.assertEqual(
+            query_filter.model_dump(exclude_none=True)["must"][0]["match"]["value"],
+            "服装",
+        )
+
+    def test_uncategorized_match_keeps_stricter_threshold(self):
+        client = MagicMock()
+        client.search.return_value = [
+            SimpleNamespace(
+                id="anchor-1",
+                score=0.641,
+                payload={"cn_word": "冬季外套"},
+            )
+        ]
+        with patch("services.qdrant_store.get_qdrant_client", return_value=client):
+            result = search_cn_anchor_by_word("winter coat", [0.0] * VECTOR_SIZE)
+
+        self.assertIsNone(result)
+        self.assertIsNone(client.search.call_args.kwargs["query_filter"])
+
     def test_anchor_payload_has_gte_metadata_and_768_vector_contract(self):
         client = MagicMock()
         with patch("services.qdrant_store.get_qdrant_client", return_value=client):
