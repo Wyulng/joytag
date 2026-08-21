@@ -169,7 +169,7 @@ Keycloak :8080（对外但安全组限办公 IP；realm 导入；MFA TOTP 强制
 
 **.env.example**：+ LLM_PROVIDER/LLM_BASE_URL/LLM_API_KEY/LLM_MODEL、PII_GUARD_MODE、DATABASE_URL、OIDC_ISSUER/OIDC_JWKS_URL/OIDC_CLIENT_ID、SESSION_SECRET、TLS_ENABLED、KEYCLOAK_PUBLIC_HOSTNAME、POSTGRES_PASSWORD。
 
-**CLAUDE.md / README.md**：更新"无认证"章节。
+**README.md / 部署说明**：更新"无认证"章节。
 
 ### 7.4 关键设计决策
 
@@ -205,7 +205,7 @@ Keycloak :8080（对外但安全组限办公 IP；realm 导入；MFA TOTP 强制
 ## 十、风险与前置条件
 
 - **R1 内存**：部署前 `free -h` 确认 ≥6GB；不足则降 qdrant/Keycloak 限额或 Keycloak 独立机器。
-- **R2 TLS 需域名**：Let's Encrypt 不签发裸 IP；域名就绪前 HTTP + 安全组 IP 白名单过渡（写入 CLAUDE.md 警示），P2 接 Caddy。
+- **R2 TLS 需域名**：Let's Encrypt 不签发裸 IP；域名就绪前 HTTP + 安全组 IP 白名单过渡（写入 README.md 部署警示），P2 接 Caddy。
 - **R3 Keycloak 远程引导**：`kcadm.sh` 脚本化创建首用户；realm 层强制 OTP。
 - **R4 Presidio 中文误报**：regex-only 保守模式 + 型号 token 白名单；P0 后观察。
 - **R5 审计失败=500**：可责性优先；healthcheck 扩展 DB 连通性。
