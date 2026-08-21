@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import math
 import os
 from functools import lru_cache
 from pathlib import Path
@@ -71,6 +72,43 @@ def _resolve_device() -> str:
         return "cpu"
 
 
+def _repair_position_ids(model) -> None:
+    """Repair the non-persistent GTE position-id buffer after HF loading.
+
+    The GTE remote model registers ``position_ids`` as a non-persistent buffer.
+    With the current Transformers loader this buffer can be left with
+    uninitialised values even though the model weights load successfully.  A
+    corrupted buffer only appears when the first short text is encoded and
+    produces an opaque RoPE index error.  Position ids are definitionally the
+    contiguous range [0, max_position_embeddings), so restoring that invariant
+    is safe and keeps the fix local to the loaded model.
+    """
+    try:
+        import torch
+
+        transformer = model._first_module()
+        auto_model = getattr(transformer, "auto_model", None)
+        embeddings = getattr(auto_model, "embeddings", None)
+        position_ids = getattr(embeddings, "position_ids", None)
+        if position_ids is None or position_ids.ndim != 1:
+            return
+
+        expected = torch.arange(
+            position_ids.numel(), device=position_ids.device, dtype=position_ids.dtype
+        )
+        if not torch.equal(position_ids, expected):
+            logger.warning(
+                "[embedding] 检测到 GTE position_ids 缓冲区异常，已恢复为连续位置索引"
+            )
+            with torch.no_grad():
+                position_ids.copy_(expected)
+    except Exception as e:
+        # Do not make model startup depend on an implementation detail of a
+        # remote-code model. The first real encode still performs dimension and
+        # availability checks and will surface a clear service error if needed.
+        logger.debug("[embedding] position_ids 修复跳过: %s", e)
+
+
 @lru_cache(maxsize=1)
 def _get_model():
     """延迟加载并缓存 GTE 多语言 embedding 模型。"""
@@ -92,6 +130,7 @@ def _get_model():
         if not Path(model_ref).exists() and EMBEDDING_MODEL_REVISION:
             kwargs["revision"] = EMBEDDING_MODEL_REVISION
         model = SentenceTransformer(model_ref, **kwargs)
+        _repair_position_ids(model)
         logger.info("[embedding] 多语言向量模型加载成功: %s", model_ref)
         return model
     except Exception as e:
@@ -117,6 +156,11 @@ async def get_embedding(text: str) -> list[float]:
             raise ValueError(
                 f"embedding dimension mismatch: expected {EMBEDDING_DIM}, got {len(vector)}"
             )
+        if EMBEDDING_NORMALIZE:
+            norm = math.sqrt(sum(value * value for value in vector))
+            if norm == 0:
+                raise ValueError("embedding vector norm must not be zero")
+            vector = [value / norm for value in vector]
         return vector
     except Exception as e:
         logger.error("[embedding] 向量推理失败: %s", e)
