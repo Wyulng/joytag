@@ -79,7 +79,7 @@ flowchart LR
     -> LLM 批量翻译为六国种子
     -> Amazon + eBay 搜索建议
     -> 跨源去重与国家配额合并
-    -> GTE 多语言向量直接检索中文锚点
+    -> 按类目过滤后用 GTE 多语言向量直接检索中文锚点（默认阈值 0.60；无类目 0.75）
     -> 规则硬拦截 / LLM 评估 / 人工复核
     -> local_tags、pending_review 或 blocked_decisions
 ~~~
@@ -311,7 +311,7 @@ backend/
     schemas.py                   # 受版本控制的 API 契约与合规常量（启动必需）
   services/
     collectors/                  # 中文、Amazon、eBay 采集和种子构建
-    alignment.py                 # 翻译、锚点对齐、合规评估和入库
+    alignment.py                 # 多语言锚点对齐、合规评估和入库
     recommend.py                 # 向量召回与 LLM 精排
     qdrant_store.py              # Qdrant 集合与幂等 CRUD
     llm.py / llm_provider.py     # LLM 调用、重试和 provider 适配

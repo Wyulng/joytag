@@ -22,9 +22,13 @@ from models.schemas import (
     DEFAULT_RETENTION_DAYS,
 )
 from services.recommend import TOP_K_RECALL, RERANK_DEPTH
+from services.qdrant_store import (
+    ANCHOR_MATCH_THRESHOLD,
+    ANCHOR_MATCH_UNCATEGORIZED_THRESHOLD,
+)
 from services.collectors.countries import EU_COUNTRIES
 
-LAST_UPDATED = "2026-08-15"
+LAST_UPDATED = "2026-08-21"
 SYSTEM_NAME = "joytag"
 DISCLOSURE_URL = "/v1/disclosure/parameters"
 
@@ -75,6 +79,7 @@ SECTIONS = [
         "paragraphs": [
             "推荐结果由以下参数共同决定（按重要性排序）：",
             f"  向量相似度：标题向量与标签向量余弦相似度召回 top-{TOP_K_RECALL}（本地 GTE 多语言模型，768 维）；",
+            f"  锚点对齐：海外词先按类目筛选中文锚点，再在同一多语言向量空间匹配；默认阈值为 {ANCHOR_MATCH_THRESHOLD:.2f}，无类目时为 {ANCHOR_MATCH_UNCATEGORIZED_THRESHOLD:.2f}；",
             f"  LLM 精排：综合语义匹配、文化合规、趋势热度、去重，从 top-{RERANK_DEPTH} 选出最终结果并生成推荐理由；",
             "  合规过滤（硬性排除）：仅推荐合规状态为「可复用」的标签；"
             "被拦截词（含环保声明等 UCPD 2024/825 Annex I 类别）永不参与；",
@@ -87,7 +92,7 @@ SECTIONS = [
         "id": "ai_involvement",
         "title": "3. AI 参与声明（AI Act Art.50）",
         "paragraphs": [
-            "本系统的标签翻译、合规评估与推荐排序由 AI 模型参与完成。"
+            "本系统的动态采集种子翻译、合规评估与推荐排序由 AI 模型参与完成；海外词与中文锚点直接进行多语言向量匹配。"
             "推荐 API 响应的每条标签带 ai_generated 标记：LLM 不可用时回退纯向量排序（标记为 false）。",
             "若您将本系统输出用于面向消费者的内容，请另行披露 AI 参与。",
         ],

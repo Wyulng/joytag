@@ -33,6 +33,8 @@ from models.schemas import (
 )
 from services.embedding import get_embedding
 from services.qdrant_store import (
+    ANCHOR_MATCH_THRESHOLD,
+    ANCHOR_MATCH_UNCATEGORIZED_THRESHOLD,
     list_pending_reviews, get_pending_by_id, delete_pending_review,
     upsert_local_tag, list_local_tags, get_pending_review_count, delete_local_tag, count_local_tags,
     list_cn_anchors, count_cn_anchors, delete_cn_anchor,
@@ -307,7 +309,7 @@ async def disclosure_parameters():
     """
     return DisclosureParameters(
         version=DISCLOSURE_VERSION,
-        last_updated="2026-08-15",
+        last_updated="2026-08-21",
         system_name="joytag",
         description="Joytag 为 Joybuy 欧洲站商品标题生成本地化长尾标签推荐，供站内搜索召回使用（平台功能支持型推荐系统）。",
         input_signals=[
@@ -333,6 +335,15 @@ async def disclosure_parameters():
                 description="标题向量与标签向量的余弦相似度（GTE 多语言模型，768 维，本地推理）。",
                 relative_importance=f"第一级排序：召回 top-{TOP_K_RECALL} 候选。",
                 values={"model": "Alibaba-NLP/gte-multilingual-base", "dim": 768, "top_n": TOP_K_RECALL},
+            ),
+            DisclosureParameter(
+                key="anchor_match_threshold",
+                description="海外词先按采集类目过滤中文锚点，再进行跨语言余弦相似度匹配；无类目时使用更严格阈值。",
+                relative_importance="锚点对齐过滤：低于适用阈值的海外词进入人工审核队列。",
+                values={
+                    "categorized_threshold": ANCHOR_MATCH_THRESHOLD,
+                    "uncategorized_threshold": ANCHOR_MATCH_UNCATEGORIZED_THRESHOLD,
+                },
             ),
             DisclosureParameter(
                 key="llm_rerank",
@@ -376,7 +387,7 @@ async def disclosure_parameters():
             ),
             DisclosureParameter(
                 key="llm_assessment",
-                description="LLM 翻译 + 文化合规评估（规则库优先，规则未命中才调用 LLM）。",
+                description="LLM 动态种子翻译 + 文化合规评估（规则库优先，规则未命中才调用 LLM）。海外词锚点匹配不调用翻译 LLM。",
                 relative_importance="决定标签合规状态（可复用/需拦截/存疑）。",
             ),
             DisclosureParameter(

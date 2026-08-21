@@ -45,10 +45,9 @@ huggingface_cache/
 .DS_Store
 Thumbs.db
 
-# Local embedding weights are runtime assets; API contract sources under
-# backend/models/ must remain tracked.
-backend/models/bge-small-zh-v1.5/
-backend/models/gte-multilingual-base/
+# Local embedding weight directories are runtime assets; API contract source
+# files directly under backend/models/ remain tracked.
+backend/models/*/
 
 # Local agent instructions
 /AGENTS.md

@@ -14,7 +14,7 @@
 
 ## 一、背景与目标
 
-Joytag 为 Joybuy 欧洲站点提供长尾标签推荐：淘宝搜索建议构建中文锚点，Amazon 搜索建议作为海外主源，eBay 搜索建议作为海外辅助源；词条经翻译、锚点检索、规则检查和 LLM 合规评估后写入 Qdrant，再由推荐 API 输出。LLM 通过 provider 适配层调用，默认配置为 DeepSeek/OpenAI-compatible，并可通过配置切换 Azure 或 Bedrock。生产配置已实现 Keycloak SSO、RBAC、CSRF 与端口改绑；TLS 仍需在实际部署时完成。
+Joytag 为 Joybuy 欧洲站点提供长尾标签推荐：淘宝搜索建议构建中文锚点，Amazon 搜索建议作为海外主源，eBay 搜索建议作为海外辅助源；海外词经 GTE 多语言向量直接匹配中文锚点，再通过规则检查和 LLM 合规评估后写入 Qdrant，由推荐 API 输出。LLM 通过 provider 适配层调用，默认配置为 DeepSeek/OpenAI-compatible，并可通过配置切换 Azure 或 Bedrock；翻译仅用于从中文锚点批量生成采集种子。生产配置已实现 Keycloak SSO、RBAC、CSRF 与端口改绑；TLS 仍需在实际部署时完成。
 
 目标：**技术层面**（代码与架构）使系统满足 GDPR（数据合规、透明度、删除权、出境）、DSA（推荐系统透明度、可解释）、UCPD（标签不得构成误导性商业行为）要求。不做合规申报文档，法规强制披露以代码功能落地（参数披露接口、DSAR 受理端点、透明度页面）。
 
