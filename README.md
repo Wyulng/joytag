@@ -63,8 +63,8 @@ flowchart LR
 | 组件 | 作用 | 默认版本 / 实现 |
 | --- | --- | --- |
 | Backend | FastAPI API、采集调度、管理后台 | Python 3.11 + FastAPI + Uvicorn |
-| Qdrant | 锚点、标签和审核队列的向量检索与存储 | v1.9.0，512 维 |
-| Embedding | 中文锚点和标签向量化 | `BAAI/bge-small-zh-v1.5` |
+| Qdrant | 锚点、标签和审核队列的向量检索与存储 | v1.9.0，768 维 |
+| Embedding | 中文锚点、海外词和标签的多语言向量化 | `Alibaba-NLP/gte-multilingual-base` |
 | LLM | 翻译、文化适配、合规评估和推荐精排 | provider 适配层 |
 | Postgres | 审计、LLM trace、lineage、DSAR 和留存策略 | PostgreSQL 16 |
 | Keycloak | OIDC SSO、RBAC 和 TOTP | 24.0.5 |
@@ -79,7 +79,7 @@ flowchart LR
     -> LLM 批量翻译为六国种子
     -> Amazon + eBay 搜索建议
     -> 跨源去重与国家配额合并
-    -> 翻译回中文并检索相似锚点
+    -> GTE 多语言向量直接检索中文锚点
     -> 规则硬拦截 / LLM 评估 / 人工复核
     -> local_tags、pending_review 或 blocked_decisions
 ~~~
@@ -127,7 +127,7 @@ Copy-Item .env.example .env
 ./dev.ps1
 ~~~
 
-首次安装脚本会创建 Python 3.11 虚拟环境、安装 `backend/requirements.txt`，并将 Embedding 模型下载到 `backend/models/bge-small-zh-v1.5/`。只有该模型权重目录被忽略；`backend/models/__init__.py` 与 `backend/models/schemas.py` 是启动必需的运行时 API 契约源码，必须纳入 Git。
+首次安装脚本会创建 Python 3.11 虚拟环境、安装 `backend/requirements.txt`，并将 GTE 多语言 Embedding 模型下载到 `backend/models/gte-multilingual-base/`。模型权重目录被忽略；`backend/models/__init__.py` 与 `backend/models/schemas.py` 是启动必需的运行时 API 契约源码，必须纳入 Git。
 
 启动后：
 

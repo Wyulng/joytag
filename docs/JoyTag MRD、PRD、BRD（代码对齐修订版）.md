@@ -56,8 +56,7 @@ JoyTag 的产品思路是先形成带来源和审核状态的结构化标签库�
 中文锚点生成六国种子
   → Amazon 搜索建议（主源）+ eBay 搜索建议（辅助源）
   → 按国家配额合并与去重
-  → 翻译为中文
-  → 中文锚点向量检索
+  → GTE 多语言向量直接检索中文锚点
   → 安全词/禁用词/UCPD 规则检查
   → LLM 文化与合规评估
   → local_tags / pending_review / blocked_decisions
@@ -254,7 +253,7 @@ flowchart LR
 | 管理 UI | 静态 HTML + 原生 JavaScript | 内嵌单页，无 React、无前端构建链、无独立前端服务 |
 | 中文数据源 | 淘宝搜索建议 | 用于中文锚点采集；当前不描述为六国语言合规评估流程 |
 | 海外数据源 | Amazon completion + eBay autosuggest | Amazon 为主源，eBay 为辅助源 |
-| Embedding | 本地 `BAAI/bge-small-zh-v1.5` | 512 维；优先从 `backend/models/bge-small-zh-v1.5/` 加载，模型权重不进入 Git |
+| Embedding | 本地 `Alibaba-NLP/gte-multilingual-base` | 768 维；优先从 `backend/models/gte-multilingual-base/` 加载，模型权重不进入 Git |
 | LLM | provider 适配层 | 默认 DeepSeek 的 OpenAI-compatible 接口，可配置 Azure 和 Bedrock |
 | 向量库 | Qdrant 1.9.0 | 四个集合、余弦距离、确定性 ID、payload 保存 provenance |
 | 合规数据库 | PostgreSQL 16 | audit、llm_trace、lineage、DSAR 和 retention 数据 |
@@ -271,8 +270,7 @@ flowchart LR
 最新中文锚点生成六国种子
     -> Amazon completion 与 eBay autosuggest 按国家采集
     -> 跨源去重、国家配额合并和来源透传
-    -> 海外词翻译为中文
-    -> 中文锚点向量检索
+    -> GTE 多语言向量直接检索中文锚点
     -> 国家规则与 UCPD 内置规则检查
     -> LLM 合规评估
     -> local_tags / pending_review / blocked_decisions
@@ -312,14 +310,14 @@ flowchart LR
 
 ## 3.4 Qdrant 数据模型
 
-当前四个集合使用 512 维余弦向量。`pending_review` 和 `blocked_decisions` 不参与语义检索，但使用零向量作为 Qdrant 点位占位，以便统一保存和分页管理。
+当前四个集合使用 768 维余弦向量。`pending_review` 和 `blocked_decisions` 不参与语义检索，但使用 768 维零向量作为 Qdrant 点位占位，以便统一保存和分页管理。
 
 | 集合 | 向量 | 目的 | 主要 payload |
 | --- | --- | --- | --- |
-| `cn_anchors` | 512 维本地 Embedding | 中文锚点库，不直接作为对外标签输出 | `cn_word`、`category`、来源和采集批次 |
-| `local_tags` | 512 维本地 Embedding | 推荐唯一标签来源 | `word`、`country`、合规状态、来源、趋势分、中文锚点 |
-| `pending_review` | 512 维零向量 | 人工待审核队列 | 词条、国家、审核理由、规则和 provenance |
-| `blocked_decisions` | 512 维零向量 | 被拦截词与决策证据 | 词条、国家、理由、rule_id、来源和 trace |
+| `cn_anchors` | 768 维本地 Embedding | 中文锚点库，不直接作为对外标签输出 | `cn_word`、`category`、来源和采集批次 |
+| `local_tags` | 768 维本地 Embedding | 推荐唯一标签来源 | `word`、`country`、合规状态、来源、趋势分、中文锚点 |
+| `pending_review` | 768 维零向量 | 人工待审核队列 | 词条、国家、审核理由、规则和 provenance |
+| `blocked_decisions` | 768 维零向量 | 被拦截词与决策证据 | 词条、国家、理由、rule_id、来源和 trace |
 
 所有自然键使用确定性 UUID：中文锚点按 `cn_word` 生成，标签和审核记录按 `word + country` 生成。词条的向量、业务字段和合规字段分开保存，删除或 DSAR 擦除时可以按记录 ID 处理完整链路。
 
@@ -388,12 +386,12 @@ OpenAPI `/docs` 和受版本控制的 `backend/models/schemas.py` 是请求和�
 7. 模拟 LLM 不可用，验证接口仍按向量相似度回退，且 `ai_assisted=false`；
 8. 访问参数披露、透明度页面和 DSAR 受理接口。
 
-当前技术演示使用本地 `BAAI/bge-small-zh-v1.5` 进行向量化，使用 LLM provider 进行翻译、合规判断和精排；演示数据以运行时实际采集、已有词库和审核结果为准。
+当前技术演示使用本地 `Alibaba-NLP/gte-multilingual-base` 进行多语言向量化，使用 LLM provider 进行种子翻译、合规判断和精排；海外词锚点匹配不再逐词调用外译中 LLM。演示数据以运行时实际采集、已有词库和审核结果为准。
 
 ## 3.8 非功能要求
 
 - **可用性**：LLM 精排失败时返回向量排序结果；海外采集按国家处理异常并使用既有种子回退；
-- **一致性**：中文锚点、标签和查询必须使用同一 512 维 Embedding 空间，不能混用不同模型产生的向量；
+- **一致性**：中文锚点、标签和查询必须使用同一 768 维 GTE Embedding 空间，不能混用不同模型产生的向量；
 - **安全性**：生产必须启用认证、强密钥、TLS 和网络边界；管理写操作必须带 CSRF 与角色检查；
 - **合规性**：词条来源、规则命中、LLM 评估、人工操作和拦截决策均需保留可关联证据；
 - **可追溯性**：数据源、采集批次、模型调用、规则与人工操作可以通过 provenance、trace、lineage 和审计链关联查询；
@@ -446,7 +444,7 @@ OpenAPI `/docs` 和受版本控制的 `backend/models/schemas.py` 是请求和�
 **[已实现]**：
 
 - 淘宝中文锚点、Amazon/eBay 海外建议采集；
-- 本地 512 维 Embedding 和四个 Qdrant 集合；
+- 本地 768 维 GTE Embedding 和四个 Qdrant 集合；
 - 翻译、锚点检索、规则、LLM 与人工审核流水线；
 - 推荐 API、候选集约束、回退和 provenance；
 - 管理单页、Keycloak/RBAC/CSRF；
@@ -585,7 +583,7 @@ OpenAPI `/docs` 和受版本控制的 `backend/models/schemas.py` 是请求和�
 | API/Pydantic 契约与国家范围 | `backend/models/schemas.py` |
 | 推荐路由与管理 API | `backend/app.py` |
 | top-16 / top-8 / 默认 top-5 | `backend/services/recommend.py` |
-| 四个 Qdrant 集合与 512 维向量 | `backend/services/qdrant_store.py` |
+| 四个 Qdrant 集合与 768 维向量 | `backend/services/qdrant_store.py` |
 | 淘宝中文采集 | `backend/services/collectors/cn_ecommerce.py`、`cn_longtail.py` |
 | Amazon/eBay 海外采集 | `amazon_suggest.py`、`ebay_suggest.py`、`overseas_trends.py` |
 | Embedding 模型 | `backend/services/embedding.py` |

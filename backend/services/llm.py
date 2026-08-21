@@ -163,28 +163,6 @@ async def assess_single(word: str, country: str, category: str | None = None) ->
                              retry_count=0, prompt_pii=pii_map, word=word, parsed=parsed)
     return assessment, reason, None, trace_id
 
-# ---------- 翻译海外词为中文（用于查找锚点）----------
-async def translate_foreign_to_chinese(foreign_word: str) -> str:
-    """
-    将海外趋势词翻译为中文，用于查找对应中文锚点。
-    """
-    foreign_word = _sanitize_user_input(foreign_word)
-    clean_word, pii_map = await pseudonymize_async(foreign_word)
-    prompt = f"""将以下海外电商趋势词翻译为中文（仅返回中文词汇，不需要解释）：
-
-趋势词：{clean_word}
-
-只输出中文词汇，不要其他内容。"""
-
-    messages = [{"role": "user", "content": prompt}]
-    result = await _call_llm_with_retry(
-        messages, temperature=0.1, call_type="translate", word=foreign_word, prompt_pii=pii_map
-    )
-    chinese_word = _strip_json_fence(result.content)
-    chinese_word = chinese_word.strip().strip('"')
-    return chinese_word
-
-
 # ---------- 批量翻译中文锚点为本地语种子（用于海外采集动态种子，2026-08） ----------
 TRANSLATE_BATCH_SIZE = 12   # 单次批量翻译词数上限（seed_builder 分批共用，改此一处两处同步）
 

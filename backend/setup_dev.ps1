@@ -8,12 +8,13 @@ Set-Location (Join-Path $PSScriptRoot "..")
 uv venv --python 3.11 .venv
 uv pip install --python .venv/Scripts/python.exe -r backend/requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
 
-# Embedding 模型：hf-mirror 大文件走 AWS CDN 国内不通，用 ModelScope 下载到本地目录
-if (-not (Test-Path "backend\models\bge-small-zh-v1.5\model.safetensors")) {
-    Write-Host "下载 embedding 模型（ModelScope，约 96MB）..."
+# Embedding 模型：使用 ModelScope 下载 GTE 多语言模型到本地目录
+if (-not ((Test-Path "backend\models\gte-multilingual-base\config.json") -and
+          (Test-Path "backend\models\gte-multilingual-base\model.safetensors"))) {
+    Write-Host "下载 embedding 模型（ModelScope，约 650MB；运行时内存更高）..."
     uv pip install --python .venv/Scripts/python.exe modelscope -i https://pypi.tuna.tsinghua.edu.cn/simple
     Set-Location backend
-    ..\.venv\Scripts\python.exe -c "from modelscope.hub.snapshot_download import snapshot_download; snapshot_download('AI-ModelScope/bge-small-zh-v1.5', local_dir='models/bge-small-zh-v1.5')"
+    ..\.venv\Scripts\python.exe -c "from modelscope.hub.snapshot_download import snapshot_download; snapshot_download('iic/gte_sentence-embedding_multilingual-base', local_dir='models/gte-multilingual-base')"
     Set-Location ..
 }
 
