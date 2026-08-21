@@ -1,6 +1,6 @@
 import logging
 from datetime import datetime, timezone
-from services.llm import assess_single, translate_foreign_to_chinese
+from services.llm import assess_single
 from services.embedding import get_embedding
 from services.qdrant_store import (
     upsert_cn_anchor,
@@ -58,7 +58,7 @@ async def process_overseas_word(word: str, country: str, anchor_cn_id: str = Non
                                 source: str = "overseas", collection_run_id: str = None):
     """
     处理海外趋势词（本地化词汇）：
-    1. 将海外词翻译为中文，查找对应的中文锚点
+    1. 使用 GTE 多语言向量直接查找对应的中文锚点
     2. 执行三级漏斗：规则库硬拦截 → LLM软判定
     3. 可复用 → 生成向量 → 存入 local_tags（关联到中文锚点）
     4. 存疑 → 写入 pending_review 队列
@@ -71,14 +71,14 @@ async def process_overseas_word(word: str, country: str, anchor_cn_id: str = Non
         "collection_run_id": collection_run_id,
         "collected_at": datetime.now(timezone.utc).isoformat(),
     }
-    # 第0步：翻译海外词为中文，查找对应锚点
-    cn_word = await translate_foreign_to_chinese(word)
-    logger.info(f"[alignment] 海外词翻译为中文: {word} -> {cn_word}")
-    cn_vector = await get_embedding(cn_word)
-    anchor_info = search_cn_anchor_by_word(cn_word, cn_vector, score_threshold=0.75)
+    # 第0步：直接使用多语言向量查找中文锚点，避免每个海外词额外调用翻译 LLM
+    query_vector = await get_embedding(word)
+    anchor_info = search_cn_anchor_by_word(word, query_vector, score_threshold=0.75)
 
     resolved_anchor_cn_id = anchor_info["id"] if anchor_info else None
-    resolved_cn_word = anchor_info["cn_word"] if anchor_info else cn_word
+    resolved_cn_word = anchor_info["cn_word"] if anchor_info else None
+    if anchor_info:
+        provenance["anchor_match_score"] = anchor_info["score"]
 
     status, reason, rule_id, trace_id = await assess_single(word, country, category=category)
     logger.info(f"[alignment] 评估结果: {word} ({country}) -> {status}")
@@ -86,14 +86,13 @@ async def process_overseas_word(word: str, country: str, anchor_cn_id: str = Non
     if status == "可复用":
         if resolved_anchor_cn_id is None:
             # 未找到中文锚点，降级为存疑，需人工补充锚点
-            logger.warning(f"[alignment] 未找到中文锚点: {cn_word}，降级为存疑")
+            logger.warning(f"[alignment] 未找到多语言中文锚点: {word}，降级为存疑")
             pending_id = insert_pending_review(
                 word=word,
                 country=country,
-                assessment_reason=reason + f" [未找到对应中文锚点：{cn_word}]",
+                assessment_reason=reason + " [未找到对应中文锚点]",
                 source=source,
                 category=category,
-                cn_original=cn_word,
                 provenance=provenance,
                 llm_trace_id=trace_id,
                 rule_ids=[rule_id] if rule_id else None,
@@ -101,20 +100,18 @@ async def process_overseas_word(word: str, country: str, anchor_cn_id: str = Non
             )
             _record_word_lineage(collection_run_id or "manual", "overseas_collection",
                                  "pending_review", word, country, "pending_no_anchor",
-                                 {"cn_word": cn_word})
+                                 {"query_language": "multilingual"})
             return {
                 "stored": False,
                 "action": "pending_no_anchor",
                 "pending_id": pending_id,
                 "status": "存疑",
-                "reason": reason,
-                "cn_word": cn_word
+                "reason": reason
             }
 
-        vector = await get_embedding(word)
         tag_id = upsert_local_tag(
             word=word,
-            vector=vector,
+            vector=query_vector,
             country=country,
             compliance_status=status,
             reason=reason,
@@ -149,7 +146,6 @@ async def process_overseas_word(word: str, country: str, anchor_cn_id: str = Non
             assessment_reason=reason,
             source=source,
             category=category,
-            cn_original=cn_word,
             provenance=provenance,
             llm_trace_id=trace_id,
             rule_ids=[rule_id] if rule_id else None,
@@ -157,14 +153,14 @@ async def process_overseas_word(word: str, country: str, anchor_cn_id: str = Non
         )
         _record_word_lineage(collection_run_id or "manual", "overseas_collection",
                              "pending_review", word, country, "pending",
-                             {"cn_word": cn_word})
+                             {"anchor_cn_word": resolved_cn_word} if resolved_cn_word else {})
         return {
             "stored": False,
             "action": "pending",
             "pending_id": pending_id,
             "status": status,
             "reason": reason,
-            "cn_word": cn_word
+            "anchor_cn_word": resolved_cn_word
         }
 
     else:  # "需拦截" —— 持久化决策留痕（UCPD/GDPR 举证，不再丢弃）
@@ -175,7 +171,7 @@ async def process_overseas_word(word: str, country: str, anchor_cn_id: str = Non
             reason=reason,
             source=source,
             category=category,
-            cn_word=cn_word,
+            cn_word=resolved_cn_word,
             rule_id=rule_id,
             llm_trace_id=trace_id,
             trend_score=trend_score,
@@ -183,7 +179,7 @@ async def process_overseas_word(word: str, country: str, anchor_cn_id: str = Non
         )
         _record_word_lineage(collection_run_id or "manual", "overseas_collection",
                              "blocked_decisions", word, country, "blocked",
-                             {"cn_word": cn_word, "rule_id": rule_id})
+                             {"anchor_cn_word": resolved_cn_word, "rule_id": rule_id})
         return {
             "stored": False,
             "action": "blocked",
@@ -191,5 +187,5 @@ async def process_overseas_word(word: str, country: str, anchor_cn_id: str = Non
             "status": status,
             "reason": reason,
             "rule_id": rule_id,
-            "cn_word": cn_word
+            "anchor_cn_word": resolved_cn_word
         }

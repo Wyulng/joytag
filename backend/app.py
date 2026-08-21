@@ -330,9 +330,9 @@ async def disclosure_parameters():
         ranking_parameters=[
             DisclosureParameter(
                 key="vector_similarity",
-                description="标题向量与标签向量的余弦相似度（bge-small-zh-v1.5，512 维，本地推理）。",
+                description="标题向量与标签向量的余弦相似度（GTE 多语言模型，768 维，本地推理）。",
                 relative_importance=f"第一级排序：召回 top-{TOP_K_RECALL} 候选。",
-                values={"model": "BAAI/bge-small-zh-v1.5", "dim": 512, "top_n": TOP_K_RECALL},
+                values={"model": "Alibaba-NLP/gte-multilingual-base", "dim": 768, "top_n": TOP_K_RECALL},
             ),
             DisclosureParameter(
                 key="llm_rerank",

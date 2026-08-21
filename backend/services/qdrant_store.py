@@ -21,9 +21,28 @@ LOCAL_COLLECTION = "local_tags"           # 本地化 Tag（唯一输出源）
 PENDING_COLLECTION = "pending_review"     # 待人工审核队列
 BLOCKED_COLLECTION = "blocked_decisions"  # 被拦截词（UCPD/GDPR 合规决策留痕，2026-08 新增）
 
-VECTOR_SIZE = 512  # bge-small-zh-v1.5 (512 dimensions)
+VECTOR_SIZE = 768  # Alibaba-NLP/gte-multilingual-base (768 dimensions)
+EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "Alibaba-NLP/gte-multilingual-base")
+EMBEDDING_MODEL_REVISION = os.getenv(
+    "EMBEDDING_MODEL_REVISION",
+    "9bbca17d9273fd0d03d5725c7a4b0f6b45142062",
+)
+EMBEDDING_NORMALIZED = os.getenv("EMBEDDING_NORMALIZE", "true").strip().lower() not in {
+    "0", "false", "no", "off"
+}
 
 _client = None
+
+
+def _add_embedding_metadata(payload: dict) -> dict:
+    """标记所有 Qdrant 点使用的向量模型，避免不同空间的数据混入。"""
+    payload.update({
+        "embedding_model": EMBEDDING_MODEL,
+        "embedding_dim": VECTOR_SIZE,
+        "embedding_revision": EMBEDDING_MODEL_REVISION,
+        "embedding_normalized": EMBEDDING_NORMALIZED,
+    })
+    return payload
 
 def _generate_deterministic_id(*parts: str) -> str:
     """基于自然键生成确定性 UUID，确保同一词条生成相同 ID"""
@@ -57,6 +76,15 @@ def get_qdrant_client():
                     )
             else:
                 logger.debug(f"[qdrant] 集合已存在: {name}")
+                collection = _client.get_collection(name)
+                vector_config = collection.config.params.vectors
+                configured_size = getattr(vector_config, "size", None)
+                if configured_size is not None and configured_size != VECTOR_SIZE:
+                    raise RuntimeError(
+                        f"Qdrant collection {name} uses {configured_size} dimensions; "
+                        f"the current embedding model requires {VECTOR_SIZE}. "
+                        "Back up and recreate qdrant_storage for a cold start."
+                    )
     return _client
 
 
@@ -104,6 +132,7 @@ def upsert_cn_anchor(cn_word: str, vector: list[float], category: str = None,
         payload["provenance"] = provenance
     if updated_at:
         payload["updated_at"] = updated_at
+    _add_embedding_metadata(payload)
     client.upsert(
         collection_name=ANCHOR_COLLECTION,
         points=[PointStruct(
@@ -232,6 +261,7 @@ def upsert_local_tag(
         payload["rule_ids"] = rule_ids
     if assessed_by:
         payload["assessed_by"] = assessed_by
+    _add_embedding_metadata(payload)
 
     client.upsert(
         collection_name=LOCAL_COLLECTION,
@@ -450,6 +480,7 @@ def insert_pending_review(
         payload["rule_ids"] = rule_ids
     if assessed_by:
         payload["assessed_by"] = assessed_by
+    _add_embedding_metadata(payload)
 
     client.upsert(
         collection_name=PENDING_COLLECTION,
@@ -533,9 +564,9 @@ def delete_pending_review(point_id: str) -> bool:
     )
     logger.info(f"[qdrant] 删除待审核记录: {point_id}")
     return True
-def search_cn_anchor_by_word(cn_word: str, vector: list[float], score_threshold: float = 0.75) -> dict | None:
+def search_cn_anchor_by_word(query_text: str, vector: list[float], score_threshold: float = 0.75) -> dict | None:
     """
-    通过向量相似度在 cn_anchors 中查找中文锚点。
+    通过多语言向量相似度在 cn_anchors 中查找中文锚点。
     返回找到的锚点记录（含 id, cn_word），未找到或相似度低于阈值时返回 None。
     """
     client = get_qdrant_client()
@@ -547,11 +578,11 @@ def search_cn_anchor_by_word(cn_word: str, vector: list[float], score_threshold:
         with_vectors=False
     )
     if not results:
-        logger.debug(f"[qdrant] 未找到中文锚点: {cn_word}")
+        logger.debug(f"[qdrant] 未找到中文锚点: {query_text}")
         return None
     best = results[0]
     if best.score < score_threshold:
-        logger.debug(f"[qdrant] 中文锚点相似度不足: {cn_word} (score={best.score:.3f} < {score_threshold})")
+        logger.debug(f"[qdrant] 中文锚点相似度不足: {query_text} (score={best.score:.3f} < {score_threshold})")
         return None
     logger.info(f"[qdrant] 找到中文锚点: {best.payload.get('cn_word')} (score={best.score:.3f})")
     return {
@@ -601,6 +632,7 @@ def insert_blocked_decision(
         payload["llm_trace_id"] = llm_trace_id
     if provenance:
         payload["provenance"] = provenance
+    _add_embedding_metadata(payload)
 
     client.upsert(
         collection_name=BLOCKED_COLLECTION,

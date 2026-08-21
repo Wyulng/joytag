@@ -48,6 +48,7 @@ Thumbs.db
 # Local embedding weights are runtime assets; API contract sources under
 # backend/models/ must remain tracked.
 backend/models/bge-small-zh-v1.5/
+backend/models/gte-multilingual-base/
 
 # Local agent instructions
 /AGENTS.md
