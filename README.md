@@ -106,6 +106,12 @@ flowchart LR
 
 所有集合使用确定性 ID，重复采集可以幂等更新；词条同时保留 `source_type`、`collection_run_id` 和 `collected_at` 等来源字段。
 
+### Embedding 契约与迁移
+
+当前默认向量模型为 `Alibaba-NLP/gte-multilingual-base`，固定 revision 为 `9bbca17d9273fd0d03d5725c7a4b0f6b45142062`，输出 768 维、默认 CPU 推理并做 L2 归一化，Qdrant 使用 COSINE 距离。每个向量点还会写入模型名、维度、revision 和归一化状态，避免不同向量空间的数据混用。
+
+这意味着旧版 BGE 512 维集合不能直接复用。首次从旧版本升级时，请先备份 `qdrant_storage/`，再为 GTE 建立新的 Qdrant 数据目录或完成一次全量重建；服务检测到现有集合维度不是 768 时会主动失败，而不会静默混写旧数据。
+
 ## 快速开始
 
 ### 前置条件
@@ -127,7 +133,7 @@ Copy-Item .env.example .env
 ./dev.ps1
 ~~~
 
-首次安装脚本会创建 Python 3.11 虚拟环境、安装 `backend/requirements.txt`，并将 GTE 多语言 Embedding 模型下载到 `backend/models/gte-multilingual-base/`。模型权重目录被忽略；`backend/models/__init__.py` 与 `backend/models/schemas.py` 是启动必需的运行时 API 契约源码，必须纳入 Git。
+首次安装脚本会创建 Python 3.11 虚拟环境、安装 `backend/requirements.txt`，并通过 ModelScope 下载约 650 MB 的 GTE 多语言 Embedding 模型到 `backend/models/gte-multilingual-base/`。模型权重目录被忽略；`backend/models/__init__.py` 与 `backend/models/schemas.py` 是启动必需的运行时 API 契约源码，必须纳入 Git。GTE 使用 `trust_remote_code` 加载，首次启动和 CPU 推理的内存开销会明显高于旧版 BGE。
 
 启动后：
 
@@ -153,7 +159,7 @@ docker compose ps
 
 ### `POST /v1/tag/recommend`
 
-服务间调用需要 Keycloak Bearer token，并包含 `joytag:recommend` scope；默认限流为每个客户端 IP 每分钟 20 次。
+服务间调用需要 Keycloak Bearer token，并包含 `joytag:recommend` scope；默认限流为每个客户端 IP 每分钟 20 次。请求中的 `title` 长度为 1-500，`category` 最长 100，`top_k` 取值 1-10，`target_country` 会规范化为大写并限制为六个支持国家。
 
 请求示例：
 
@@ -193,6 +199,8 @@ curl -X POST http://localhost:8001/v1/tag/recommend \
 }
 ~~~
 
+LLM 精排只允许从向量召回候选中选择标签；未知词、重复词或格式错误的 LLM 输出会被丢弃，并按向量相似度补齐结果。LLM 超时、服务异常或不可用时，接口回退到向量排序，回退项的 `ai_generated` 为 `false`，因此 `ai_assisted` 只在结果中确实包含 AI 精排项时为 `true`。
+
 ### 其他公开接口
 
 | 接口 | 说明 |
@@ -223,6 +231,10 @@ curl -X POST http://localhost:8001/v1/tag/recommend \
 | `LLM_PROVIDER` | LLM 适配器 | `openai_compat`、`azure` 或 `bedrock` |
 | `LLM_BASE_URL` / `LLM_API_KEY` / `LLM_MODEL` | LLM 服务 | 默认配置面向 DeepSeek 兼容接口 |
 | `QDRANT_URL` / `QDRANT_API_KEY` | 向量数据库 | Compose 会将 URL 覆盖为 `http://qdrant:6333` |
+| `EMBEDDING_MODEL` / `EMBEDDING_MODEL_PATH` | 多语言 Embedding 模型及本地路径 | 默认 GTE；本地目录存在且包含权重时优先使用 |
+| `EMBEDDING_MODEL_REVISION` | 远程模型固定版本 | 默认 `9bbca17d9273fd0d03d5725c7a4b0f6b45142062` |
+| `EMBEDDING_DEVICE` / `EMBEDDING_NORMALIZE` | 推理设备与向量归一化 | 默认 `cpu` / `true`，支持 `auto`、`cuda` |
+| `ANCHOR_MATCH_THRESHOLD` / `ANCHOR_MATCH_UNCATEGORIZED_THRESHOLD` | 海外词到中文锚点的匹配阈值 | 默认 `0.60` / `0.75`；阈值必须在 0-1 之间 |
 | `DATABASE_URL` | 合规数据库 | Compose 自动注入容器内地址 |
 | `AUTH_ENABLED` | 管理端认证 | 本地开发为 `false`；生产必须为 `true` |
 | `OIDC_ISSUER` / `OIDC_JWKS_URL` / `OIDC_TOKEN_URL` | Keycloak OIDC | 外部 issuer 与容器内 token/JWKS 地址可分开配置 |
@@ -237,10 +249,11 @@ Compose 还要求填写 `POSTGRES_PASSWORD`、`JOYTAG_DB_PASSWORD`、`KEYCLOAK_D
 
 1. 准备一台至少约 6 GB 内存的服务器，安装 Docker Compose。
 2. 复制 `.env.example` 为 `.env`，生成并填写所有基础设施密钥、LLM 配置和 `OIDC_ISSUER`。
-3. 启动服务：`docker compose up -d --build`。
-4. 为 `8001` 和 `8080` 设置安全组白名单；不要把 Qdrant `6333/6334` 或 Postgres `5432` 暴露到公网。
-5. 通过 Keycloak 创建首个用户并分配 `admin` 角色；首次登录按要求绑定 TOTP。
-6. 配置域名和 TLS 反向代理后，将 `TLS_ENABLED=true`，再开放管理端访问。
+3. 将 GTE 模型权重单独准备到 `backend/models/gte-multilingual-base/`，或通过 `EMBEDDING_MODEL_PATH` 指定已挂载的模型目录；模型权重不随 Git 发布。
+4. 启动服务：`docker compose up -d --build`。
+5. 为 `8001` 和 `8080` 设置安全组白名单；不要把 Qdrant `6333/6334` 或 Postgres `5432` 暴露到公网。
+6. 通过 Keycloak 创建首个用户并分配 `admin` 角色；首次登录按要求绑定 TOTP。
+7. 配置域名和 TLS 反向代理后，将 `TLS_ENABLED=true`，再开放管理端访问。
 
 建议上线前执行：
 
