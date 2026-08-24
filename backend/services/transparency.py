@@ -21,14 +21,18 @@ from models.schemas import (
     DSAR_NOTE_MAX_LENGTH, DSAR_RATE_LIMIT, DSAR_RESPONSE_DEADLINE_DAYS,
     DEFAULT_RETENTION_DAYS,
 )
-from services.recommend import TOP_K_RECALL, RERANK_DEPTH
+from services.recommend import (
+    TOP_K_RECALL,
+    RERANK_DEPTH,
+    get_recommend_rerank_mode,
+)
 from services.qdrant_store import (
     ANCHOR_MATCH_THRESHOLD,
     ANCHOR_MATCH_UNCATEGORIZED_THRESHOLD,
 )
 from services.collectors.countries import EU_COUNTRIES
 
-LAST_UPDATED = "2026-08-21"
+LAST_UPDATED = "2026-08-24"
 SYSTEM_NAME = "joytag"
 DISCLOSURE_URL = "/v1/disclosure/parameters"
 
@@ -67,10 +71,10 @@ SECTIONS = [
         "paragraphs": [
             "Joytag 是为 Joybuy 欧洲站服务的本地化长尾标签推荐系统：从 Amazon 搜索建议接口"
             f"（{_COUNTRIES_TEXT} 六国站点）、eBay 搜索建议接口与中文电商搜索建议（淘宝搜索接口）采集趋势词，"
-            "经 AI 种子翻译、多语言向量匹配、文化合规评估与人工审核后，为商品标题推荐合规的搜索标签，用于站内搜索召回支持。",
+            "经 AI 种子翻译、多语言向量匹配、规则优先的文化合规评估与人工审核后，为商品标题推荐合规的搜索标签，用于站内搜索召回支持。",
             "数据最小化：仅采集公开搜索建议词，不存储用户名、帖子 ID 或正文；"
-            "商品标题仅在推荐请求的瞬间被处理，发送外部 AI 前经假名化"
-            "（邮箱/电话/IP/卡号等模式替换为占位符），不写入日志。",
+            "商品标题仅在推荐请求的瞬间被处理，默认只在本地向量化；仅当服务端启用 LLM 精排时，"
+            "才会在发送外部 AI 前经假名化（邮箱/电话/IP/卡号等模式替换为占位符），不写入日志。",
         ],
     },
     {
@@ -78,9 +82,9 @@ SECTIONS = [
         "title": "2. 推荐系统如何工作（DSA Art.27）",
         "paragraphs": [
             "推荐结果由以下参数共同决定（按重要性排序）：",
-            f"  向量相似度：标题向量与标签向量余弦相似度召回 top-{TOP_K_RECALL}（本地 GTE 多语言模型，768 维）；",
+            f"  向量相似度：标题向量与标签向量余弦相似度召回 top-{TOP_K_RECALL}，默认按该分数返回 top-k（本地 GTE 多语言模型，768 维）；",
             f"  锚点对齐：海外词先按类目筛选中文锚点，再在同一多语言向量空间匹配；默认阈值为 {ANCHOR_MATCH_THRESHOLD:.2f}，无类目时为 {ANCHOR_MATCH_UNCATEGORIZED_THRESHOLD:.2f}；",
-            f"  LLM 精排：综合语义匹配、文化合规、趋势热度、去重，从 top-{RERANK_DEPTH} 选出最终结果并生成推荐理由；",
+            f"  可选 LLM 精排：仅当服务端配置为 llm 时，综合语义匹配、文化合规、趋势热度和去重，从 top-{RERANK_DEPTH} 选出最终结果并生成推荐理由；",
             "  合规过滤（硬性排除）：仅推荐合规状态为「可复用」的标签；"
             "被拦截词（含环保声明等 UCPD 2024/825 Annex I 类别）永不参与；",
             f"  国家过滤（硬性排除）：仅返回目标国家（{_COUNTRIES_TEXT}）的标签。",
@@ -92,8 +96,9 @@ SECTIONS = [
         "id": "ai_involvement",
         "title": "3. AI 参与声明（AI Act Art.50）",
         "paragraphs": [
-            "本系统的动态采集种子翻译、合规评估与推荐排序由 AI 模型参与完成；海外词与中文锚点直接进行多语言向量匹配。"
-            "推荐 API 响应的每条标签带 ai_generated 标记：LLM 不可用时回退纯向量排序（标记为 false）。",
+            "本系统的动态采集种子翻译，以及有中文锚点但规则未覆盖的文化合规评估由 AI 模型参与完成；"
+            "海外词与中文锚点直接进行多语言向量匹配，无锚点词不调用合规 LLM。推荐默认使用本地向量排序，"
+            "服务端可选启用 LLM 精排。推荐 API 响应的每条标签带 ai_generated 标记：向量排序项为 false。",
             "若您将本系统输出用于面向消费者的内容，请另行披露 AI 参与。",
         ],
     },
@@ -141,7 +146,7 @@ SECTIONS = [
 
 def transparency_payload() -> dict:
     """组装 /v1/transparency 的 JSON 结构（app.py 转 Pydantic 后返回）。"""
-    return {
+    payload = {
         "version": TRANSPARENCY_VERSION,
         "last_updated": LAST_UPDATED,
         "system_name": SYSTEM_NAME,
@@ -149,6 +154,13 @@ def transparency_payload() -> dict:
         "dsar_submission": DSAR_SUBMISSION,
         "sections": SECTIONS,
     }
+    payload["sections"] = [dict(section) for section in SECTIONS]
+    payload["sections"][1] = dict(payload["sections"][1])
+    payload["sections"][1]["paragraphs"] = list(payload["sections"][1]["paragraphs"])
+    payload["sections"][1]["paragraphs"].append(
+        f"当前服务端推荐排序模式：{get_recommend_rerank_mode()}。"
+    )
+    return payload
 
 
 def render_transparency_text() -> str:
@@ -162,6 +174,8 @@ def render_transparency_text() -> str:
     for section in SECTIONS:
         lines.append(section["title"])
         lines.extend(section["paragraphs"])
+        if section["id"] == "how_recommendation_works":
+            lines.append(f"当前服务端推荐排序模式：{get_recommend_rerank_mode()}。")
         lines.append("")
     lines.append("相关端点：")
     lines.append(f"  机器可读参数披露  GET {DISCLOSURE_URL}")

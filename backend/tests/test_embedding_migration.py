@@ -46,6 +46,7 @@ class EmbeddingMigrationTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_overseas_alignment_uses_one_direct_multilingual_embedding(self):
         vector = [0.25] * VECTOR_SIZE
+        assess = AsyncMock(return_value=("可复用", "通过", None, None))
         with (
             patch.object(alignment, "get_embedding", new=AsyncMock(return_value=vector)) as embed,
             patch.object(
@@ -53,7 +54,10 @@ class EmbeddingMigrationTests(unittest.IsolatedAsyncioTestCase):
                 "search_cn_anchor_by_word",
                 return_value={"id": "anchor-1", "cn_word": "冬季外套", "score": 0.91},
             ) as search_anchor,
-            patch.object(alignment, "assess_single", new=AsyncMock(return_value=("可复用", "通过", None, None))),
+            patch.object(
+                alignment, "check_word_against_rules", return_value=(None, "", None)
+            ),
+            patch.object(alignment, "assess_single", new=assess),
             patch.object(alignment, "upsert_local_tag", return_value="tag-1") as upsert,
             patch.object(alignment, "_record_word_lineage"),
         ):
@@ -66,9 +70,123 @@ class EmbeddingMigrationTests(unittest.IsolatedAsyncioTestCase):
 
         embed.assert_awaited_once_with("winter coat")
         search_anchor.assert_called_once_with("winter coat", vector, category="服装")
+        assess.assert_awaited_once_with("winter coat", "DE", category="服装")
         self.assertEqual(upsert.call_args.kwargs["vector"], vector)
+        self.assertEqual(upsert.call_args.kwargs["assessed_by"], "llm")
         self.assertEqual(result["anchor_cn_word"], "冬季外套")
         self.assertNotIn("translate_foreign_to_chinese", alignment.__dict__)
+
+    async def test_anchor_safe_rule_skips_assessment_and_records_rule_source(self):
+        assess = AsyncMock()
+        with (
+            patch.object(
+                alignment,
+                "get_embedding",
+                new=AsyncMock(return_value=[0.25] * VECTOR_SIZE),
+            ),
+            patch.object(
+                alignment,
+                "search_cn_anchor_by_word",
+                return_value={"id": "anchor-1", "cn_word": "冬季外套", "score": 0.91},
+            ),
+            patch.object(
+                alignment,
+                "check_word_against_rules",
+                return_value=(True, "通过安全词库", None),
+            ),
+            patch.object(alignment, "assess_single", new=assess),
+            patch.object(alignment, "upsert_local_tag", return_value="tag-1") as upsert,
+            patch.object(alignment, "_record_word_lineage"),
+        ):
+            result = await alignment.process_overseas_word("winter coat", "DE")
+
+        assess.assert_not_awaited()
+        self.assertEqual(result["action"], "approved")
+        self.assertEqual(upsert.call_args.kwargs["assessed_by"], "rule")
+
+    async def test_no_anchor_skips_llm_and_enters_pending_review(self):
+        vector = [0.25] * VECTOR_SIZE
+        assess = AsyncMock()
+        rule_check = MagicMock(return_value=(None, "", None))
+        with (
+            patch.object(alignment, "get_embedding", new=AsyncMock(return_value=vector)),
+            patch.object(alignment, "search_cn_anchor_by_word", return_value=None),
+            patch.object(
+                alignment,
+                "check_word_against_rules",
+                new=rule_check,
+            ),
+            patch.object(alignment, "assess_single", new=assess),
+            patch.object(alignment, "insert_pending_review", return_value="pending-1") as pending,
+            patch.object(alignment, "_record_word_lineage"),
+        ):
+            result = await alignment.process_overseas_word("unknown phrase", "DE")
+
+        assess.assert_not_awaited()
+        rule_check.assert_called_once_with(
+            "unknown phrase", "DE", category=None, banned_first=True
+        )
+        self.assertEqual(result["action"], "pending_no_anchor")
+        self.assertIn("未找到中文锚点，未调用 LLM", result["reason"])
+        self.assertEqual(pending.call_args.kwargs["assessed_by"], "anchor_gate")
+        self.assertNotIn("llm_trace_id", pending.call_args.kwargs)
+
+    async def test_no_anchor_banned_rule_blocks_without_llm(self):
+        assess = AsyncMock()
+        with (
+            patch.object(
+                alignment,
+                "get_embedding",
+                new=AsyncMock(return_value=[0.25] * VECTOR_SIZE),
+            ),
+            patch.object(alignment, "search_cn_anchor_by_word", return_value=None),
+            patch.object(
+                alignment,
+                "check_word_against_rules",
+                return_value=(False, "命中规则", "ucpd_env_generic"),
+            ),
+            patch.object(alignment, "assess_single", new=assess),
+            patch.object(
+                alignment, "insert_blocked_decision", return_value="blocked-1"
+            ) as blocked,
+            patch.object(alignment, "insert_pending_review") as pending,
+            patch.object(alignment, "_record_word_lineage"),
+        ):
+            result = await alignment.process_overseas_word("eco-friendly", "DE")
+
+        assess.assert_not_awaited()
+        pending.assert_not_called()
+        self.assertEqual(result["action"], "blocked")
+        self.assertEqual(result["rule_id"], "ucpd_env_generic")
+        self.assertEqual(blocked.call_args.kwargs["rule_id"], "ucpd_env_generic")
+        self.assertNotIn("llm_trace_id", blocked.call_args.kwargs)
+
+    async def test_no_anchor_safe_rule_still_requires_manual_anchor(self):
+        assess = AsyncMock()
+        with (
+            patch.object(
+                alignment,
+                "get_embedding",
+                new=AsyncMock(return_value=[0.25] * VECTOR_SIZE),
+            ),
+            patch.object(alignment, "search_cn_anchor_by_word", return_value=None),
+            patch.object(
+                alignment,
+                "check_word_against_rules",
+                return_value=(True, "通过安全词库", None),
+            ),
+            patch.object(alignment, "assess_single", new=assess),
+            patch.object(alignment, "insert_pending_review", return_value="pending-1") as pending,
+            patch.object(alignment, "upsert_local_tag") as upsert,
+            patch.object(alignment, "_record_word_lineage"),
+        ):
+            result = await alignment.process_overseas_word("winter coat", "DE")
+
+        assess.assert_not_awaited()
+        upsert.assert_not_called()
+        self.assertEqual(result["action"], "pending_no_anchor")
+        self.assertEqual(pending.call_args.kwargs["assessed_by"], "rule")
+        self.assertIn("已通过安全规则", result["reason"])
 
 
 class QdrantEmbeddingMetadataTests(unittest.TestCase):

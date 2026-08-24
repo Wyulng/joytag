@@ -29,11 +29,11 @@ Joytag 当前是后端推荐 API 与管理后台，不是面向消费者的搜�
 ## 核心能力
 
 - **多站点采集**：淘宝搜索建议用于中文锚点；Amazon completion 为海外主源，eBay autosuggest 为辅助源。
-- **两阶段推荐**：Qdrant 向量召回候选标签，再由 LLM 结合商品标题、类目和近期热词精排。
-- **三级合规漏斗**：安全词直通、禁用词和 UCPD Annex I 规则硬拦截、其余词进入 LLM 评估与人工复核。
+- **本地优先推荐**：Qdrant 向量召回后默认按 GTE 相似度排序；服务端可按需启用 LLM 精排。
+- **三级合规漏斗**：安全词直通、禁用词和 UCPD Annex I 规则硬拦截；无中文锚点直接人工复核，仅有锚点且规则未覆盖的词进入 LLM 评估。
 - **可解释推荐**：返回标签理由、相似度、来源、中文锚点和合规理由等 provenance 字段。
 - **可切换模型供应商**：通过 provider 适配层支持 OpenAI-compatible、Azure OpenAI 和 Amazon Bedrock，切换以配置为主。
-- **隐私最小化**：发送给 LLM 前对邮箱、电话、IP、IBAN 和信用卡等信息做假名化；日志不保存完整商品标题。
+- **隐私最小化**：默认推荐不向外部 LLM 发送商品标题；启用 LLM 精排时先对邮箱、电话、IP、IBAN 和信用卡等信息做假名化，日志不保存完整标题。
 - **可审计与可追溯**：管理操作使用 hash-chain 审计；LLM 调用保存 prompt 哈希、PII token 映射和词条哈希；采集任务保存 lineage 事件。
 - **统一管理后台**：内嵌原生 HTML/JS 单页，提供待审核、标签库、锚点库、规则、拦截决策、审计、DSAR 和调度管理。
 
@@ -45,16 +45,16 @@ flowchart LR
     B --> C[翻译 / 去重 / 位置评分]
     C --> D[Embedding]
     D --> E[(Qdrant)]
-    E --> F[规则库与 UCPD 规则]
-    F --> G[LLM 文化与合规评估]
+    E --> F{匹配中文锚点?}
+    F -- 否 --> I[本地规则 / 待人工复核]
+    F -- 是 --> G[规则优先 / 必要时 LLM 评估]
     G --> H[可复用标签]
-    G --> I[待人工复核]
+    G --> I
     G --> J[拦截决策留痕]
 
-    K[商品标题 + 目标国家] --> L[PII 假名化]
-    L --> M[向量召回]
+    K[商品标题 + 目标国家] --> M[本地 Embedding 与向量召回]
     M --> E
-    E --> N[LLM 精排]
+    E --> N[默认向量排序 / 可选 LLM 精排]
     N --> O[推荐结果 + provenance]
 ~~~
 
@@ -65,7 +65,7 @@ flowchart LR
 | Backend | FastAPI API、采集调度、管理后台 | Python 3.11 + FastAPI + Uvicorn |
 | Qdrant | 锚点、标签和审核队列的向量检索与存储 | v1.9.0，768 维 |
 | Embedding | 中文锚点、海外词和标签的多语言向量化 | `Alibaba-NLP/gte-multilingual-base` |
-| LLM | 翻译、文化适配、合规评估和推荐精排 | provider 适配层 |
+| LLM | 动态种子翻译、必要的合规评估和可选推荐精排 | provider 适配层 |
 | Postgres | 审计、LLM trace、lineage、DSAR 和留存策略 | PostgreSQL 16 |
 | Keycloak | OIDC SSO、RBAC 和 TOTP | 24.0.5 |
 | Scheduler | 定时采集和每日留存清理 | APScheduler 3.x |
@@ -80,7 +80,8 @@ flowchart LR
     -> Amazon + eBay 搜索建议
     -> 跨源去重与国家配额合并
     -> 按类目过滤后用 GTE 多语言向量直接检索中文锚点（默认阈值 0.60；无类目 0.75）
-    -> 规则硬拦截 / LLM 评估 / 人工复核
+    -> 无锚点：本地禁用规则硬拦截，否则直接人工复核（不调用 LLM）
+    -> 有锚点：规则硬拦截 / 规则未覆盖时 LLM 评估 / 人工复核
     -> local_tags、pending_review 或 blocked_decisions
 ~~~
 
@@ -88,10 +89,10 @@ flowchart LR
 
 ~~~text
 商品标题 + 类目 + 目标国家
-    -> PII 假名化
-    -> Embedding
+    -> 本地 Embedding
     -> Qdrant 过滤 country 与 compliance_status
-    -> 召回 top-16，LLM 精排最多 top-8
+    -> 召回 top-16，默认按向量相似度排序
+    -> 可选：服务端启用 LLM 精排时，标题先假名化并精排最多 top-8
     -> 返回默认最多 5 个带解释和 provenance 的 Tag
 ~~~
 
@@ -101,7 +102,7 @@ flowchart LR
 | --- | --- | --- |
 | `cn_anchors` | 中文商品锚点 | 采集、去重、向量化后写入 |
 | `local_tags` | 可复用的本地化 Tag | 通过规则和合规评估后写入 |
-| `pending_review` | 需要人工判断的词条 | LLM 返回“存疑”或进入审核队列 |
+| `pending_review` | 需要人工判断的词条 | 无中文锚点或 LLM 返回“存疑” |
 | `blocked_decisions` | 被拦截词的决策证据 | 保存国家、理由、规则 ID 和来源 |
 
 所有集合使用确定性 ID，重复采集可以幂等更新；词条同时保留 `source_type`、`collection_run_id` 和 `collected_at` 等来源字段。
@@ -119,7 +120,7 @@ flowchart LR
 - Windows PowerShell 或兼容的 PowerShell 环境
 - Docker Desktop / Docker Engine 与 Compose
 - 本地开发需要 Python 3.11 和 [uv](https://docs.astral.sh/uv/)
-- 一个可用的 LLM API Key；Qdrant 密钥也必须显式配置
+- 完整采集与合规评估需要可用的 LLM API Key；默认向量推荐本身不依赖 LLM。Qdrant 密钥必须显式配置
 
 ### 本地开发
 
@@ -182,30 +183,32 @@ curl -X POST http://localhost:8001/v1/tag/recommend \
   "recommendations": [
     {
       "word": "示例标签",
-      "reason": "与商品标题和类目匹配",
+      "reason": "基于多语言向量相似度排序推荐",
       "similarity": 0.86,
       "source": "amazon_suggest",
       "compliance_reason": "通过目标国家规则与审核",
       "anchor_cn_word": "户外鞋",
       "trend_score": 0.74,
-      "ai_generated": true
+      "ai_generated": false
     }
   ],
   "total_candidates": 16,
   "filtered_candidates": 8,
-  "ai_assisted": true,
-  "parameters_version": "...",
+  "ai_assisted": false,
+  "parameters_version": "2026-08-24",
   "disclosure_url": "/v1/disclosure/parameters"
 }
 ~~~
 
-LLM 精排只允许从向量召回候选中选择标签；未知词、重复词或格式错误的 LLM 输出会被丢弃，并按向量相似度补齐结果。LLM 超时、服务异常或不可用时，接口回退到向量排序，回退项的 `ai_generated` 为 `false`，因此 `ai_assisted` 只在结果中确实包含 AI 精排项时为 `true`。
+默认 `RECOMMEND_RERANK_MODE=vector`，推荐按多语言向量相似度确定性排序，不调用 LLM，返回项的 `ai_generated` 和响应的 `ai_assisted` 均为 `false`。服务端可改为 `llm`：LLM 仍只能从向量召回候选中选择标签，未知词、重复词或格式错误的输出会被丢弃；模型不可用时继续回退向量排序。
+
+所有业务 LLM 调用最多进行 2 次 provider 尝试（首次请求 + 1 次瞬时故障重试）；只有超时、网络连接错误、HTTP 408/429/5xx 会重试，等待 1 秒。合规评估、动态种子翻译和可选精排的输出上限分别为 256、512、512 tokens。规则比较使用 Unicode NFKC、首尾去空白、连续空白合并和 `casefold`，但保留标点、连字符与重音，原词仍原样展示和入库。
 
 ### 其他公开接口
 
 | 接口 | 说明 |
 | --- | --- |
-| `GET /health` | 基础健康检查；`?deep=1` 同时检查 Qdrant、LLM 和 Postgres |
+| `GET /health` | 检查 Qdrant、Postgres 和 Embedding；`?deep=1` 仅验证 LLM 配置，不调用模型；带共享密钥的 `?llm_probe=1` 才真实探测 |
 | `GET /v1/disclosure/parameters` | DSA Art.27 机器可读的推荐参数披露 |
 | `GET /v1/transparency` | 公开透明度披露 JSON；`/transparency` 提供 HTML 版本 |
 | `POST /v1/dsar/request` | 公开受理数据主体访问、删除或反对请求，限流 5 次/小时 |
@@ -230,6 +233,7 @@ LLM 精排只允许从向量召回候选中选择标签；未知词、重复词�
 | --- | --- | --- |
 | `LLM_PROVIDER` | LLM 适配器 | `openai_compat`、`azure` 或 `bedrock` |
 | `LLM_BASE_URL` / `LLM_API_KEY` / `LLM_MODEL` | LLM 服务 | 默认配置面向 DeepSeek 兼容接口 |
+| `RECOMMEND_RERANK_MODE` | 推荐排序模式 | 默认 `vector`（零 LLM）；可设为 `llm` 启用可选精排 |
 | `QDRANT_URL` / `QDRANT_API_KEY` | 向量数据库 | Compose 会将 URL 覆盖为 `http://qdrant:6333` |
 | `EMBEDDING_MODEL` / `EMBEDDING_MODEL_PATH` | 多语言 Embedding 模型及本地路径 | 默认 GTE；本地目录存在且包含权重时优先使用 |
 | `EMBEDDING_MODEL_REVISION` | 远程模型固定版本 | 默认 `9bbca17d9273fd0d03d5725c7a4b0f6b45142062` |
@@ -239,6 +243,7 @@ LLM 精排只允许从向量召回候选中选择标签；未知词、重复词�
 | `AUTH_ENABLED` | 管理端认证 | 本地开发为 `false`；生产必须为 `true` |
 | `OIDC_ISSUER` / `OIDC_JWKS_URL` / `OIDC_TOKEN_URL` | Keycloak OIDC | 外部 issuer 与容器内 token/JWKS 地址可分开配置 |
 | `SESSION_SECRET` | 会话签名 | 认证开启时必填，建议使用 `openssl rand -hex 32` 生成 |
+| `HEALTH_PROBE_TOKEN` | 真实 LLM 健康探测密钥 | 留空时禁用 `llm_probe`；请求须携带 `X-Health-Probe-Token` |
 | `PII_GUARD_MODE` | PII 处理 | 默认 `regex_only`；仅允许在受控环境关闭 |
 | `CORS_ORIGINS` | 跨域白名单 | 默认空，同源内嵌管理页不需要配置 |
 | `TLS_ENABLED` | Secure Cookie | 接入 HTTPS 反向代理后设为 `true` |
@@ -261,6 +266,14 @@ Compose 还要求填写 `POSTGRES_PASSWORD`、`JOYTAG_DB_PASSWORD`、`KEYCLOAK_D
 docker compose config
 docker compose ps
 Invoke-WebRequest http://localhost:8001/health
+Invoke-WebRequest 'http://localhost:8001/health?deep=1'
+~~~
+
+真实 LLM 探测会产生一次模型请求，只应由受控运维调用：
+
+~~~powershell
+Invoke-WebRequest 'http://localhost:8001/health?deep=1&llm_probe=1' `
+  -Headers @{ 'X-Health-Probe-Token' = $env:HEALTH_PROBE_TOKEN }
 ~~~
 
 ### 持久化与备份
@@ -325,7 +338,7 @@ backend/
   services/
     collectors/                  # 中文、Amazon、eBay 采集和种子构建
     alignment.py                 # 多语言锚点对齐、合规评估和入库
-    recommend.py                 # 向量召回与 LLM 精排
+    recommend.py                 # 向量召回、默认向量排序与可选 LLM 精排
     qdrant_store.py              # Qdrant 集合与幂等 CRUD
     llm.py / llm_provider.py     # LLM 调用、重试和 provider 适配
     pii_guard.py                 # PII 假名化
