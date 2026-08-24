@@ -2,21 +2,36 @@ from typing import List, Dict, Any, Optional
 import asyncio
 import json
 import logging
+import os
 import httpx
 from services.embedding import get_embedding
-
-logger = logging.getLogger(__name__)
 from services.qdrant_store import get_qdrant_client, LOCAL_COLLECTION
 from services.collectors.amazon_suggest import get_country_hot_words
-from services.llm import _strip_json_fence, _call_llm_with_retry
+from services.llm import LLM_MAX_RETRIES, _strip_json_fence, _call_llm_with_retry
 from services.pii_guard import pseudonymize_async
 from services.logging_config import log_safe_hash
 from qdrant_client.models import Filter, FieldCondition, MatchValue
+
+logger = logging.getLogger(__name__)
 
 # 推荐调参常量（唯一权威源）：transparency 正文与 app.py 披露共用，改此处即可三处同步
 TOP_K_RECALL = 16   # 向量召回候选数（top-16）
 RERANK_DEPTH = 8    # LLM 精排输入深度（top-8）
 MAX_OUTPUT_DEFAULT = 5  # 精排输出默认上限（实际以请求 top_k 为准）
+RERANK_MAX_TOKENS = 512
+RECOMMEND_RERANK_MODES = {"vector", "llm"}
+
+
+def get_recommend_rerank_mode() -> str:
+    """返回服务端推荐排序模式；非法配置安全回退到零 LLM 的向量模式。"""
+    mode = os.getenv("RECOMMEND_RERANK_MODE", "vector").strip().lower()
+    if mode not in RECOMMEND_RERANK_MODES:
+        logger.warning(
+            "[recommend] 非法 RECOMMEND_RERANK_MODE=%r，已回退 vector",
+            mode,
+        )
+        return "vector"
+    return mode
 
 RERANK_SYSTEM_PROMPT = """你是一个欧洲电商本土化运营专家。你的任务是根据商品信息，从候选标签列表中选出最合适的标签，并按推荐优先级排序，同时为每个标签生成简短的推荐理由（面向内部运营人员，语言为中文）。
 
@@ -34,6 +49,38 @@ RERANK_SYSTEM_PROMPT = """你是一个欧洲电商本土化运营专家。你的
   ]
 }
 """
+
+
+def rank_tags_by_vector(
+    candidates: List[Dict[str, Any]],
+    max_output: int = MAX_OUTPUT_DEFAULT,
+) -> List[Dict[str, Any]]:
+    """按向量相似度确定性排序，不调用趋势接口、PII 处理或 LLM。"""
+    if max_output <= 0:
+        return []
+
+    ranked: List[Dict[str, Any]] = []
+    selected: set[str] = set()
+    for candidate in sorted(
+        candidates,
+        key=lambda item: item.get("similarity", 0.0),
+        reverse=True,
+    ):
+        word = candidate.get("word")
+        if not isinstance(word, str) or not word.strip():
+            continue
+        key = word.strip().casefold()
+        if key in selected:
+            continue
+        ranked.append({
+            "word": word,
+            "reason": "基于多语言向量相似度排序推荐",
+            "ai_generated": False,
+        })
+        selected.add(key)
+        if len(ranked) >= max_output:
+            break
+    return ranked
 
 
 def validate_rerank_recommendations(
@@ -220,7 +267,8 @@ async def rerank_tags_with_llm(
     logger.info(f"[recommend] 请求 LLM 精排: {len(top_candidates)} 个候选")
     try:
         llm_result = await _call_llm_with_retry(
-            messages, temperature=0.2, max_retries=2,
+            messages, temperature=0.2, max_tokens=RERANK_MAX_TOKENS,
+            max_retries=LLM_MAX_RETRIES,
             call_type="rerank", prompt_pii=pii_map
         )
     except httpx.TimeoutException:

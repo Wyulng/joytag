@@ -1,6 +1,7 @@
 import json
 import re
 import logging
+import unicodedata
 from filelock import FileLock
 from typing import List, Dict, Tuple
 from pathlib import Path
@@ -18,6 +19,13 @@ RULES_DIR.mkdir(parents=True, exist_ok=True)
 
 # 合法的国家代码白名单（防止路径遍历攻击）：派生自 countries.EU_COUNTRIES 唯一权威源
 VALID_COUNTRIES = {c.lower() for c in EU_COUNTRIES}
+
+
+def _normalize_rule_key(word: str) -> str:
+    """生成保守比较键；保留标点、连字符和重音，原文不被改写。"""
+    normalized = unicodedata.normalize("NFKC", word)
+    normalized = re.sub(r"\s+", " ", normalized).strip()
+    return normalized.casefold()
 
 
 def _validate_country(country: str) -> str:
@@ -183,8 +191,13 @@ def add_banned_word(country: str, word: str, rule_id: str | None = None,
     if "banned" not in data:
         data["banned"] = []
     entries = _normalize_entries(data["banned"])
-    words = [e["word"] for e in entries]
-    if word not in words:
+    word_key = _normalize_rule_key(word)
+    existing_keys = {
+        _normalize_rule_key(e["word"])
+        for e in entries
+        if isinstance(e.get("word"), str)
+    }
+    if word_key not in existing_keys:
         entries.append({
             "word": word,
             "categories": categories or [],
@@ -211,8 +224,13 @@ def add_safe_word(country: str, word: str, categories: List[str] | None = None,
     if "safe" not in data:
         data["safe"] = []
     entries = _normalize_entries(data["safe"])
-    words = [e["word"] for e in entries]
-    if word not in words:
+    word_key = _normalize_rule_key(word)
+    existing_keys = {
+        _normalize_rule_key(e["word"])
+        for e in entries
+        if isinstance(e.get("word"), str)
+    }
+    if word_key not in existing_keys:
         entries.append({
             "word": word,
             "categories": categories or [],
@@ -234,7 +252,12 @@ def remove_banned_word(country: str, word: str) -> dict:
     file_path = RULES_DIR / f"{country}.json"
     data = _read_json(file_path)
     entries = _normalize_entries(data.get("banned", []))
-    remaining = [e for e in entries if e["word"] != word]
+    word_key = _normalize_rule_key(word)
+    remaining = [
+        e for e in entries
+        if not isinstance(e.get("word"), str)
+        or _normalize_rule_key(e["word"]) != word_key
+    ]
     if len(remaining) != len(entries):
         data["banned"] = remaining
         _write_json(file_path, data)
@@ -248,7 +271,12 @@ def remove_safe_word(country: str, word: str) -> dict:
     file_path = RULES_DIR / f"{country}_safe.json"
     data = _read_json(file_path)
     entries = _normalize_entries(data.get("safe", []))
-    remaining = [e for e in entries if e["word"] != word]
+    word_key = _normalize_rule_key(word)
+    remaining = [
+        e for e in entries
+        if not isinstance(e.get("word"), str)
+        or _normalize_rule_key(e["word"]) != word_key
+    ]
     if len(remaining) != len(entries):
         data["safe"] = remaining
         _write_json(file_path, data)
@@ -258,22 +286,37 @@ def remove_safe_word(country: str, word: str) -> dict:
 
 def _match_ucpd(word: str) -> Tuple[str, str] | None:
     """UCPD 内置种子匹配（词边界、忽略大小写）。命中返回 (rule_id, 命中词)。"""
+    normalized_word = _normalize_rule_key(word)
     for rule_id, terms in UCPD_ENV_BANNED.items():
         for term in terms:
-            if _term_pattern(term).search(word):
+            normalized_term = _normalize_rule_key(term)
+            if normalized_term and _term_pattern(normalized_term).search(normalized_word):
                 return rule_id, term
     return None
 
 
-def check_word_against_rules(word: str, country: str, category: str | None = None) -> Tuple[bool | None, str, str | None]:
+def check_word_against_rules(
+    word: str,
+    country: str,
+    category: str | None = None,
+    *,
+    banned_first: bool = False,
+) -> Tuple[bool | None, str, str | None]:
     """
     综合检查安全词库和禁用词库（含 UCPD 内置种子）：
+    - 默认保持安全词优先；无锚点门控可用 banned_first=True 强制禁用规则优先
     - 命中安全词 → (True, "通过安全词库", None) 表示可复用
     - 命中禁用词 → (False, 理由, rule_id) 表示需拦截
     - 否则 → (None, "", None) 需进一步 LLM 评估
     """
+    word_key = _normalize_rule_key(word)
     safe_words = get_safe_words(country)
-    if word in safe_words:
+    safe_match = any(
+        _normalize_rule_key(safe_word) == word_key
+        for safe_word in safe_words
+        if isinstance(safe_word, str)
+    )
+    if safe_match and not banned_first:
         return True, "通过安全词库", None
 
     # UCPD Annex I 内置种子（优先级高于国家规则文件，保证不可被误删）
@@ -284,11 +327,14 @@ def check_word_against_rules(word: str, country: str, category: str | None = Non
 
     # 国家规则文件：大小写不敏感子串匹配（防短语嵌长词绕过）；安全词库保持精确匹配
     banned_entries = get_banned_entries(country)
-    word_cf = word.casefold()
     for e in banned_entries:
         term = e["word"]
-        if term.casefold() in word_cf:
+        term_key = _normalize_rule_key(term) if isinstance(term, str) else ""
+        if term_key and term_key in word_key:
             rule_id = e.get("rule_id") or "manual_banned"
             return False, f"命中{country}广告法禁用词库({rule_id})", rule_id
+
+    if safe_match:
+        return True, "通过安全词库", None
 
     return None, "", None

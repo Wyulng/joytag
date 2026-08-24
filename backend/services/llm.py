@@ -5,6 +5,7 @@ import time
 import hashlib
 import asyncio
 import logging
+import httpx
 from typing import Literal
 from dotenv import load_dotenv
 from services.rule_manager import check_word_against_rules
@@ -16,6 +17,11 @@ from services.logging_config import get_request_id
 logger = logging.getLogger(__name__)
 
 load_dotenv()
+
+# 单次业务调用最多尝试两次（首次 + 1 次瞬时故障重试）。
+LLM_MAX_RETRIES = 1
+ASSESS_MAX_TOKENS = 256
+TRANSLATE_MAX_TOKENS = 512
 
 # 用户输入清洗：限制长度 + 移除控制字符
 _MAX_USER_INPUT_LENGTH = 500
@@ -87,31 +93,50 @@ def _record_trace(call_type: str, *, messages: list[dict], result: LLMResult | N
         return None
 
 # ---------- 带重试的 LLM 调用 ----------
+def _is_retryable_llm_error(error: Exception) -> bool:
+    """仅网络瞬时故障、408/429 和 5xx 值得重试。"""
+    if isinstance(error, (httpx.TimeoutException, httpx.NetworkError)):
+        return True
+    if isinstance(error, httpx.HTTPStatusError):
+        status = error.response.status_code
+        return status in (408, 429) or 500 <= status < 600
+    return False
+
+
 async def _call_llm_with_retry(messages: list[dict], *, temperature: float,
-                               max_tokens: int | None = None, max_retries: int = 3,
+                               max_tokens: int | None = None,
+                               max_retries: int = LLM_MAX_RETRIES,
                                call_type: str | None = None, word: str | None = None,
-                               prompt_pii: dict | None = None) -> LLMResult:
+                               prompt_pii: dict | None = None,
+                               trace_success: bool = True) -> LLMResult:
     provider = get_llm_provider()
     start = time.perf_counter()
-    last_exception = None
+    last_exception: Exception | None = None
+    last_attempt = 0
     for attempt in range(max_retries + 1):
+        last_attempt = attempt
         try:
             result = await provider.chat_completion(
                 messages, temperature=temperature, max_tokens=max_tokens
             )
-            if call_type:
+            result.retry_count = attempt
+            if call_type and trace_success:
                 _record_trace(call_type, messages=messages, result=result,
                               latency_ms=result.latency_ms, retry_count=attempt,
                               prompt_pii=prompt_pii, word=word)
             return result
         except Exception as e:
             last_exception = e
-            if attempt < max_retries:
-                await asyncio.sleep(2 ** attempt)
+            if attempt < max_retries and _is_retryable_llm_error(e):
+                await asyncio.sleep(1)
+                continue
+            break
     if call_type:
         _record_trace(call_type, messages=messages, error=str(last_exception),
                       latency_ms=int((time.perf_counter() - start) * 1000),
-                      retry_count=max_retries, prompt_pii=prompt_pii, word=word)
+                      retry_count=last_attempt, prompt_pii=prompt_pii, word=word)
+    if last_exception is None:  # pragma: no cover - range 至少执行一次，防御性保护
+        raise RuntimeError("LLM 调用未执行")
     raise last_exception
 
 # ---------- 单次评估（用于海外词，已为本地化语言）----------
@@ -145,7 +170,9 @@ async def assess_single(word: str, country: str, category: str | None = None) ->
     ]
 
     result = await _call_llm_with_retry(
-        messages, temperature=0.1, word=word, prompt_pii=pii_map
+        messages, temperature=0.1, max_tokens=ASSESS_MAX_TOKENS,
+        max_retries=LLM_MAX_RETRIES, call_type="assess", word=word,
+        prompt_pii=pii_map, trace_success=False
     )
     content = result.content
     parsed = _parse_json_fallback(content)
@@ -160,7 +187,8 @@ async def assess_single(word: str, country: str, category: str | None = None) ->
     reason = reason.strip()[:200]
     # 解析后统一留痕（含结构化结果，避免与重试包装器重复记录）
     trace_id = _record_trace("assess", messages=messages, result=result, latency_ms=result.latency_ms,
-                             retry_count=0, prompt_pii=pii_map, word=word, parsed=parsed)
+                             retry_count=result.retry_count, prompt_pii=pii_map,
+                             word=word, parsed=parsed)
     return assessment, reason, None, trace_id
 
 # ---------- 批量翻译中文锚点为本地语种子（用于海外采集动态种子，2026-08） ----------
@@ -183,7 +211,8 @@ async def translate_chinese_to_foreign_batch(words: list[str], language: str) ->
     messages = [{"role": "user", "content": prompt}]
     try:
         result = await _call_llm_with_retry(
-            messages, temperature=0.1, call_type="translate_seed",
+            messages, temperature=0.1, max_tokens=TRANSLATE_MAX_TOKENS,
+            max_retries=LLM_MAX_RETRIES, call_type="translate_seed",
             word=",".join(clean_words), prompt_pii=pii_map
         )
     except Exception as e:

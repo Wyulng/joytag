@@ -2,6 +2,7 @@ import logging
 from datetime import datetime, timezone
 from services.llm import assess_single
 from services.embedding import get_embedding
+from services.rule_manager import check_word_against_rules
 from services.qdrant_store import (
     upsert_cn_anchor,
     upsert_local_tag,
@@ -59,11 +60,11 @@ async def process_overseas_word(word: str, country: str, anchor_cn_id: str = Non
     """
     处理海外趋势词（本地化词汇）：
     1. 使用 GTE 多语言向量直接查找对应的中文锚点
-    2. 执行三级漏斗：规则库硬拦截 → LLM软判定
-    3. 可复用 → 生成向量 → 存入 local_tags（关联到中文锚点）
-    4. 存疑 → 写入 pending_review 队列
-    5. 需拦截 → 持久化到 blocked_decisions（UCPD/GDPR 决策留痕，不再丢弃）
-    6. 未找到对应中文锚点 → 写入 pending_review（需人工补充锚点）
+    2. 无锚点时仅执行本地规则并进入待审核，不调用 LLM
+    3. 有锚点时执行三级漏斗：规则库硬拦截 → LLM软判定
+    4. 可复用 → 生成向量 → 存入 local_tags（关联到中文锚点）
+    5. 存疑 → 写入 pending_review 队列
+    6. 需拦截 → 持久化到 blocked_decisions（UCPD/GDPR 决策留痕，不再丢弃）
     """
     logger.info(f"[alignment] 处理海外词: {word} ({country}, source={source})")
     provenance = {
@@ -80,35 +81,100 @@ async def process_overseas_word(word: str, country: str, anchor_cn_id: str = Non
     if anchor_info:
         provenance["anchor_match_score"] = anchor_info["score"]
 
-    status, reason, rule_id, trace_id = await assess_single(word, country, category=category)
+    if resolved_anchor_cn_id is None:
+        rule_result, rule_reason, rule_id = check_word_against_rules(
+            word, country, category=category, banned_first=True
+        )
+        if rule_result is False:
+            logger.info(
+                f"[alignment] 无锚点海外词命中本地禁用规则: "
+                f"{word} ({country}, rule_id={rule_id})"
+            )
+            blocked_id = insert_blocked_decision(
+                word=word,
+                country=country,
+                reason=rule_reason,
+                source=source,
+                category=category,
+                rule_id=rule_id,
+                trend_score=trend_score,
+                provenance=provenance,
+            )
+            _record_word_lineage(
+                collection_run_id or "manual",
+                "overseas_collection",
+                "blocked_decisions",
+                word,
+                country,
+                "blocked",
+                {"rule_id": rule_id, "anchor_match": "none"},
+            )
+            return {
+                "stored": False,
+                "action": "blocked",
+                "blocked_id": blocked_id,
+                "status": "需拦截",
+                "reason": rule_reason,
+                "rule_id": rule_id,
+                "anchor_cn_word": None,
+            }
+
+        if rule_result is True:
+            pending_reason = f"{rule_reason}；已通过安全规则，但缺少中文锚点，需人工补充锚点"
+            assessed_by = "rule"
+        else:
+            pending_reason = "未找到中文锚点，未调用 LLM；可能未达到匹配阈值，需人工补充锚点并复核"
+            assessed_by = "anchor_gate"
+
+        logger.info(
+            f"[alignment] 未找到多语言中文锚点，跳过 LLM 并进入待审核: "
+            f"{word} ({country})"
+        )
+        pending_id = insert_pending_review(
+            word=word,
+            country=country,
+            assessment_reason=pending_reason,
+            source=source,
+            category=category,
+            provenance=provenance,
+            rule_ids=[rule_id] if rule_id else None,
+            assessed_by=assessed_by,
+        )
+        _record_word_lineage(
+            collection_run_id or "manual",
+            "overseas_collection",
+            "pending_review",
+            word,
+            country,
+            "pending_no_anchor",
+            {"query_language": "multilingual", "assessed_by": assessed_by},
+        )
+        return {
+            "stored": False,
+            "action": "pending_no_anchor",
+            "pending_id": pending_id,
+            "status": "存疑",
+            "reason": pending_reason,
+            "anchor_cn_word": None,
+        }
+
+    rule_result, rule_reason, rule_id = check_word_against_rules(
+        word, country, category=category
+    )
+    if rule_result is True:
+        status, reason, trace_id = "可复用", rule_reason, None
+        assessed_by = "rule"
+    elif rule_result is False:
+        status, reason, trace_id = "需拦截", rule_reason, None
+        assessed_by = "rule"
+    else:
+        status, reason, rule_id, trace_id = await assess_single(
+            word, country, category=category
+        )
+        assessed_by = "llm"
     logger.info(f"[alignment] 评估结果: {word} ({country}) -> {status}")
 
     if status == "可复用":
-        if resolved_anchor_cn_id is None:
-            # 未找到中文锚点，降级为存疑，需人工补充锚点
-            logger.warning(f"[alignment] 未找到多语言中文锚点: {word}，降级为存疑")
-            pending_id = insert_pending_review(
-                word=word,
-                country=country,
-                assessment_reason=reason + " [未找到对应中文锚点]",
-                source=source,
-                category=category,
-                provenance=provenance,
-                llm_trace_id=trace_id,
-                rule_ids=[rule_id] if rule_id else None,
-                assessed_by="llm"
-            )
-            _record_word_lineage(collection_run_id or "manual", "overseas_collection",
-                                 "pending_review", word, country, "pending_no_anchor",
-                                 {"query_language": "multilingual"})
-            return {
-                "stored": False,
-                "action": "pending_no_anchor",
-                "pending_id": pending_id,
-                "status": "存疑",
-                "reason": reason
-            }
-
         tag_id = upsert_local_tag(
             word=word,
             vector=query_vector,
@@ -123,7 +189,7 @@ async def process_overseas_word(word: str, country: str, anchor_cn_id: str = Non
             provenance=provenance,
             llm_trace_id=trace_id,
             rule_ids=[rule_id] if rule_id else None,
-            assessed_by="llm"
+            assessed_by=assessed_by
         )
         logger.info(f"[alignment] 海外词入库成功: {word} ({country}, id={tag_id})")
         _record_word_lineage(collection_run_id or "manual", "overseas_collection",
@@ -149,7 +215,7 @@ async def process_overseas_word(word: str, country: str, anchor_cn_id: str = Non
             provenance=provenance,
             llm_trace_id=trace_id,
             rule_ids=[rule_id] if rule_id else None,
-            assessed_by="llm"
+            assessed_by=assessed_by
         )
         _record_word_lineage(collection_run_id or "manual", "overseas_collection",
                              "pending_review", word, country, "pending",

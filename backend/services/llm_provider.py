@@ -45,6 +45,7 @@ class LLMResult:
     provider: str
     usage: dict
     latency_ms: int
+    retry_count: int = 0
 
 
 class BaseLLMProvider(ABC):

@@ -1,6 +1,6 @@
 # Joytag EU 合规改造方案（GDPR / DSA / UCPD + AI Act 附带）
 
-> 状态：**代码内合规控制已按当前仓库落地**（截至 2026-08-20）。本文件同时保留历史实施蓝图；能力是否已实现以当前代码为准，法律结论仍需独立法律审查。
+> 状态：**代码内合规控制已按当前仓库落地**（截至 2026-08-24）。本文件同时保留历史实施蓝图；能力是否已实现以当前代码为准，法律结论仍需独立法律审查。
 >
 > ## 〇、执行进度
 >
@@ -9,12 +9,13 @@
 > | P0-1~P0-8 | 合规基座：db/audit（hash-chain）、llm_provider + pii_guard + llm_trace、日志脱敏、rule_manager（UCPD 种子 + schema v2 + BE/LU bug）、qdrant_store（blocked_decisions + provenance + DSAR 原语）、alignment/采集器（拦截持久化 + source 透传 + run_id lineage）、auth.py（Keycloak OIDC + CSRF）+ app.py 接线 + 审计装饰器、Keycloak realm + compose 4 服务、文档更新 + 首次 git commit | ✅ 完成 |
 > | P1 | recommend 响应 provenance（source/compliance_reason/anchor_cn_word/trend_score/ai_generated + ai_assisted/parameters_version/disclosure_url）、`/v1/disclosure/parameters`（DSA Art.27 机器可读，公开）、审计查看页 + hash-chain 校验按钮、blocked 列表页、规则页 rule_id/added_by 显示 | ✅ 完成 |
 > | P2 | dsar.py + 端点（`/v1/dsar/request` 公开 5/hour + `/admin/api/dsar/*` 检索/擦除）+ DSAR 管理页、retention.py + `compliance_retention` 每日 03:00 UTC 系统任务 + 配置/手动触发端点、`/transparency` 公开透明度页（Art.14(5)(b) + DSA 摘要 + AI Act 声明 + DSAR 表单） | ✅ 完成（代码） |
+> | LLM 降本一期 | 默认本地向量推荐、无锚点本地规则门控、业务 LLM 最多重试一次与输出上限、健康检查显式授权探测、规则词保守归一化 | ✅ 完成（代码） |
 > | 部署验证 | 服务器 `docker-compose down && up -d --build`、Keycloak 首用户 kcadm 引导、安全组收紧、curl 验证清单（见第十节） | ⏳ 待执行（部署时） |
 > | TLS | 域名就绪后 Caddy TLS + `TLS_ENABLED=true`（Let's Encrypt 不签发裸 IP） | ⏳ 待域名 |
 
 ## 一、背景与目标
 
-Joytag 为 Joybuy 欧洲站点提供长尾标签推荐：淘宝搜索建议构建中文锚点，Amazon 搜索建议作为海外主源，eBay 搜索建议作为海外辅助源；海外词经 GTE 多语言向量直接匹配中文锚点，再通过规则检查和 LLM 合规评估后写入 Qdrant，由推荐 API 输出。LLM 通过 provider 适配层调用，默认配置为 DeepSeek/OpenAI-compatible，并可通过配置切换 Azure 或 Bedrock；翻译仅用于从中文锚点批量生成采集种子。生产配置已实现 Keycloak SSO、RBAC、CSRF 与端口改绑；TLS 仍需在实际部署时完成。
+Joytag 为 Joybuy 欧洲站点提供长尾标签推荐：淘宝搜索建议构建中文锚点，Amazon 搜索建议作为海外主源，eBay 搜索建议作为海外辅助源；海外词经 GTE 多语言向量直接匹配中文锚点。无锚点词仅执行本地规则并转人工审核，有锚点词才按“规则优先、必要时 LLM”完成合规评估后写入 Qdrant。推荐 API 默认使用本地 GTE 向量排序，服务端可选启用 LLM 精排。LLM 通过 provider 适配层调用，默认配置为 DeepSeek/OpenAI-compatible，并可通过配置切换 Azure 或 Bedrock；翻译仅用于从中文锚点批量生成采集种子。生产配置已实现 Keycloak SSO、RBAC、CSRF 与端口改绑；TLS 仍需在实际部署时完成。
 
 目标：**技术层面**（代码与架构）使系统满足 GDPR（数据合规、透明度、删除权、出境）、DSA（推荐系统透明度、可解释）、UCPD（标签不得构成误导性商业行为）要求。不做合规申报文档，法规强制披露以代码功能落地（参数披露接口、DSAR 受理端点、透明度页面）。
 
@@ -27,7 +28,7 @@ Joytag 为 Joybuy 欧洲站点提供长尾标签推荐：淘宝搜索建议构�
 4. **处理活动记录（Art. 30）+ 可责性（Art. 5(2)）**：记录"谁在何时做了什么"，管理操作全审计。
 
 ### DSA 要点（对 Joytag 的影响）
-1. **Art. 27 推荐系统透明度**：适用于**所有**在线平台（非仅 VLOP），若 Joytag 的标签影响 Joybuy 站内搜索/推荐排序，平台须在条款中**通俗语言**披露主要参数（最显著标准 + 相对重要性理由），并提供**用户可随时修改参数的选项**。→ Joytag 需提供：参数文档（向量相似度 + LLM 重排 + 合规过滤 + 国家过滤）、逐条推荐理由（相似度得分/来源/合规依据）。
+1. **Art. 27 推荐系统透明度**：适用于**所有**在线平台（非仅 VLOP），若 Joytag 的标签影响 Joybuy 站内搜索/推荐排序，平台须在条款中**通俗语言**披露主要参数（最显著标准 + 相对重要性理由），并提供**用户可随时修改参数的选项**。→ Joytag 需提供：参数文档（默认向量相似度排序、服务端可选 LLM 重排、合规过滤、国家过滤）、逐条推荐理由（相似度得分/来源/合规依据），并让 AI 标记反映单次响应的实际参与情况。
 2. **Art. 30-32 商家可追溯（KYBC）**：平台自身义务，Joytag 通过数据结构支持。
 3. **P2B 法规 Art. 5**：对商业用户（卖家）的排名透明度，与 DSA Art. 27 叠加。
 
@@ -36,7 +37,7 @@ Joytag 为 Joybuy 欧洲站点提供长尾标签推荐：淘宝搜索建议构�
 2. 对 Joytag：标签合规审核（可复用/需拦截/存疑）需将 Annex I 类别纳入 banned 词规则与 LLM 审核提示词，并**留存审核理由作为可举证记录**。
 
 ### AI Act（附带，2026-08-02 已生效的透明度义务）
-- Art. 50(1)：与自然人交互的 AI 系统须告知其正在与 AI 交互（除非语境显然）。作为部署方（deployer）Joytag 需最低限度的 AI 披露机制（响应携带 ai_generated 标记 + 透明度页声明）。
+- Art. 50(1)：与自然人交互的 AI 系统须告知其正在与 AI 交互（除非语境显然）。作为部署方（deployer）Joytag 需最低限度的 AI 披露机制（响应携带反映本次调用实际情况的 `ai_generated` / `ai_assisted` 标记 + 透明度页声明）。
 
 ## 三、云服务厂商合规做法借鉴（共性模式）
 
@@ -70,7 +71,7 @@ Joytag 为 Joybuy 欧洲站点提供长尾标签推荐：淘宝搜索建议构�
 | # | 改造前差距 | 当前仓库实现 | 状态 |
 |---|-------------|---------------|------|
 | G1 | 管理变更无审计 | Postgres hash-chain 审计、操作者与 request ID 留痕、全链校验 | 已实现 |
-| G2 | LLM 地址硬编码、原文外发、无 trace | provider 适配层、PII 假名化、日志最小化、`llm_trace` | 已实现；供应商与跨境安排待部署方审查 |
+| G2 | LLM 地址硬编码、原文外发、无 trace | 默认推荐不外发标题；可选 LLM 调用走 provider 适配层、PII 假名化、日志最小化、`llm_trace` | 已实现；供应商与跨境安排待部署方审查 |
 | G3 | 删除仅覆盖单库、无留存策略 | DSAR 跨 Qdrant/Postgres 检索与擦除、ERASE 事件、定时留存清理 | 已实现 |
 | G4 | 无公开披露与反对渠道 | `/transparency`、`/v1/transparency`、`/v1/dsar/request` | 已实现 |
 | G5 | 管理端无认证、基础设施端口暴露 | Keycloak OIDC、RBAC、TOTP、CSRF、服务 scope、端口绑定与必填密钥 | 已实现；TLS 待部署 |
@@ -88,7 +89,7 @@ Joytag 为 Joybuy 欧洲站点提供长尾标签推荐：淘宝搜索建议构�
 - 生产告警、密钥托管、渗透测试和访问控制复核。
 
 ### 关键决策（已确认）
-- **D1（LLM）**：保留 DeepSeek + 假名化 + 适配层，EU API 切换 = 纯配置变更（OpenAI 兼容系改 env 即换；Azure/Bedrock 预置薄分支）。
+- **D1（LLM）**：默认推荐使用本地向量排序；保留 DeepSeek + 假名化 + 适配层用于动态种子翻译、必要的合规评估和可选精排。EU API 切换 = 纯配置变更（OpenAI 兼容系改 env 即换；Azure/Bedrock 预置薄分支）。
 - **D2（认证）**：最高标准 → Keycloak SSO（每人身份 + RBAC 角色 + MFA + OIDC 授权码+PKCE）；recommend API 走 client_credentials（scope `joytag:recommend`）。
 - 审计/溯源/trace 存 Postgres（Keycloak 共用实例分两库）。
 - 当前国家范围以代码中的 `DE/FR/NL/UK/IT/ES` 为准；LLM 调用统一走 provider 适配层，不在推荐模块重复硬编码供应商端点。
@@ -141,19 +142,19 @@ Keycloak :8080（对外但安全组限办公 IP；realm 导入；MFA TOTP 强制
 
 ### 7.3 文件级改动
 
-**backend/app.py**：lifespan 加 init_db + provider 预热；所有 `/admin/api/*` 加 `require_admin_session` + 角色依赖；recommend 加 `require_scope("joytag:recommend")`；新端点 `/auth/login|callback|logout`、`/admin/api/audit`(+verify)、`/admin/api/dsar`(+search/erase/complete)、`/admin/api/blocked`、`/admin/api/retention/config`(+run)、公开 `/v1/disclosure/parameters`、公开 `/v1/dsar/request`（5/hour）；`@audited` 装饰器挂全部管理变更端点（审计失败 → 500）；删 app.py:134 全文标题日志；版本升 2.0.0。
+**backend/app.py**：lifespan 加 init_db + provider 配置预热；所有 `/admin/api/*` 加 `require_admin_session` + 角色依赖；recommend 加 `require_scope("joytag:recommend")`；新端点 `/auth/login|callback|logout`、`/admin/api/audit`(+verify)、`/admin/api/dsar`(+search/erase/complete)、`/admin/api/blocked`、`/admin/api/retention/config`(+run)、公开 `/v1/disclosure/parameters`、公开 `/v1/dsar/request`（5/hour）；`@audited` 装饰器挂全部管理变更端点（审计失败 → 500）；不记录完整商品标题；健康检查默认不请求 LLM，只有带共享密钥的 `llm_probe=1` 才真实探测。
 
 **backend/models/schemas.py**：`RecommendItem` 加 `source/compliance_reason/anchor_cn_word/trend_score/ai_generated`；`RecommendResponse` 加 `ai_assisted/parameters_version/disclosure_url`；`RejectRequest(reason 必填)`；新增 Audit/Dsar/Blocked/Retention/DisclosureParameters 模型。
 
-**backend/services/llm.py**：去硬编码 URL 走 provider；retry 包装记录耗时 + llm_trace；assess 提示词升级 UCPD Annex I 判定（引用 rule_id）；发送前假名化。
+**backend/services/llm.py**：去硬编码 URL 走 provider；retry 包装记录耗时 + llm_trace；assess 提示词升级 UCPD Annex I 判定（引用 rule_id）；发送前假名化；三类请求设置输出上限，仅对超时、连接错误、408、429 和 5xx 重试一次。
 
-**backend/services/recommend.py**：去重复硬编码；rerank 补重试；标题假名化；llm_trace（rerank）；fallback 打 `ai_generated=False`；候选透传 provenance。
+**backend/services/recommend.py**：`RECOMMEND_RERANK_MODE=vector` 默认纯向量排序，不查询趋势热词、不假名化标题、不调用 provider；可选 `llm` 模式保留 top-8 精排、标题假名化、llm_trace 和向量 fallback；候选透传 provenance，非法配置安全回退 `vector`。
 
-**backend/services/alignment.py**：加 source/collection_run_id 参数；需拦截分支写 `blocked_decisions`（不再丢弃）；CN 流程加 provenance；每词 lineage 事件。
+**backend/services/alignment.py**：加 source/collection_run_id 参数；无锚点词仅走本地规则，禁用时写 `blocked_decisions`，其余写 `pending_review` 且不调用 LLM；有锚点词继续规则优先、必要时 LLM；CN 流程加 provenance；每词 lineage 事件。
 
 **backend/services/qdrant_store.py**：新集合 `blocked_decisions`（零向量占位，惰性创建）；三个 upsert payload 加 `provenance/llm_trace_id/rule_ids/assessed_by/updated_at`；新增 blocked CRUD、`search_words_exact`、`delete_points_by_word`、`get_point`。
 
-**backend/services/rule_manager.py**：VALID_COUNTRIES 加 be/lu（修 bug）；规则文件 schema v2（word/categories/rule_id/added_by/added_at，兼容旧格式）；内置 UCPD 六语种子；banned 子串匹配、safe 精确匹配；返回 rule_id。
+**backend/services/rule_manager.py**：规则文件 schema v2（word/categories/rule_id/added_by/added_at，兼容旧格式）；内置 UCPD 多语种种子；banned 子串匹配、safe 精确匹配；比较键统一执行 Unicode NFKC、首尾去空白、连续空白合并和 casefold，同时保留标点、连字符和重音；返回 rule_id。
 
 **backend/services/collectors/overseas_trends.py + cn_longtail.py**：source 透传修复；run_id + lineage START/COMPLETE/FAIL。
 
@@ -167,7 +168,7 @@ Keycloak :8080（对外但安全组限办公 IP；realm 导入；MFA TOTP 强制
 
 **backend/requirements.txt**：+ authlib、psycopg[binary]、psycopg-pool、presidio-analyzer、itsdangerous、cryptography。
 
-**.env.example**：+ LLM_PROVIDER/LLM_BASE_URL/LLM_API_KEY/LLM_MODEL、PII_GUARD_MODE、DATABASE_URL、OIDC_ISSUER/OIDC_JWKS_URL/OIDC_CLIENT_ID、SESSION_SECRET、TLS_ENABLED、KEYCLOAK_PUBLIC_HOSTNAME、POSTGRES_PASSWORD。
+**.env.example**：包含 LLM_PROVIDER/LLM_BASE_URL/LLM_API_KEY/LLM_MODEL、`RECOMMEND_RERANK_MODE=vector`、`HEALTH_PROBE_TOKEN`、PII_GUARD_MODE、DATABASE_URL、OIDC_ISSUER/OIDC_JWKS_URL/OIDC_CLIENT_ID、SESSION_SECRET、TLS_ENABLED、KEYCLOAK_PUBLIC_HOSTNAME、POSTGRES_PASSWORD。
 
 **README.md / 部署说明**：更新"无认证"章节。
 
@@ -179,6 +180,7 @@ Keycloak :8080（对外但安全组限办公 IP；realm 导入；MFA TOTP 强制
 4. Lineage 存 OpenLineage 形状 JSONB，不引 Marquez。
 5. 留存默认：llm_trace 90 天、lineage/audit 396 天；容器日志 10MB×5。
 6. `需拦截` 决策进 Qdrant `blocked_decisions`（词级数据集中一处）。
+7. LLM 成本与数据最小化：默认推荐零 LLM；无锚点词不调用合规 LLM；普通和 deep 健康检查不调用外部模型；真实探测必须共享密钥授权。
 
 ## 八、分阶段执行清单
 
@@ -187,6 +189,8 @@ Keycloak :8080（对外但安全组限办公 IP；realm 导入；MFA TOTP 强制
 **P1 解释与披露**：recommend 响应 provenance + `/v1/disclosure/parameters`；规则页显示 rule_id；审计查看页 + verify。
 
 **P2 生命周期与透明页**：dsar + retention + transparency 页；域名就绪后 Caddy TLS。
+
+**LLM 降本一期**：默认向量推荐；无锚点规则门控；重试和输出上限；规则比较归一化；显式授权的真实健康探测；披露版本统一为 `2026-08-24`。
 
 ## 九、验证方案
 
@@ -197,7 +201,7 @@ Keycloak :8080（对外但安全组限办公 IP；realm 导入；MFA TOTP 强制
 5. UI 通过一条 pending → 审计表出现记录（含操作者）；verify ok；篡改一行后 verify 报 mismatch
 6. client_credentials token → recommend 200 带 provenance；无 token → 401
 7. DSAR 擦除：Qdrant 点消失、trace 清除、audit 行 `<REDACTED>`、erasure_proof 有证据
-8. **Provider 切换测试**：`LLM_BASE_URL` 指本地端点重启 → 零代码改动跑通 recommend
+8. **Provider 与健康检查测试**：`/health` 和 `deep=1` 不请求模型；错误或缺失探测密钥不请求模型；正确密钥恰好探测一次；可选 `RECOMMEND_RERANK_MODE=llm` 下切换 `LLM_BASE_URL` 后零代码改动跑通或安全回退 recommend
 9. `POST /admin/api/retention/run` 返回清理计数
 10. 采集含 "eco friendly fashion" → 出现在 blocked 且理由引用 `ucpd_env_generic`
 11. 服务器 `docker-compose config -q` 静默通过（v1.29.2）
@@ -208,7 +212,7 @@ Keycloak :8080（对外但安全组限办公 IP；realm 导入；MFA TOTP 强制
 - **R2 TLS 需域名**：Let's Encrypt 不签发裸 IP；域名就绪前 HTTP + 安全组 IP 白名单过渡（写入 README.md 部署警示），P2 接 Caddy。
 - **R3 Keycloak 远程引导**：`kcadm.sh` 脚本化创建首用户；realm 层强制 OTP。
 - **R4 Presidio 中文误报**：regex-only 保守模式 + 型号 token 白名单；P0 后观察。
-- **R5 审计失败=500**：可责性优先；healthcheck 扩展 DB 连通性。
+- **R5 审计失败=500**：可责性优先；healthcheck 检查 DB/向量服务，LLM 外部探测必须显式授权且不作为普通健康状态的依赖。
 - **R6 blocked_decisions**：惰性创建无迁移。
 - **待确认**：办公 IP 白名单维护流程。
 

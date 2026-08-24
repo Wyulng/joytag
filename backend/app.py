@@ -1,4 +1,5 @@
 import os
+import hmac
 import uuid
 import json
 import asyncio
@@ -6,7 +7,7 @@ import logging
 from functools import wraps
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, HTTPException, Query, Body, Request, Depends
+from fastapi import FastAPI, HTTPException, Query, Body, Request, Depends, Header
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -50,7 +51,8 @@ from services.rule_manager import (
     VALID_COUNTRIES,
 )
 from services.recommend import (
-    retrieve_candidate_tags, rerank_tags_with_llm, filter_candidates_by_category,
+    retrieve_candidate_tags, rerank_tags_with_llm, rank_tags_by_vector,
+    filter_candidates_by_category, get_recommend_rerank_mode,
     TOP_K_RECALL, RERANK_DEPTH,
 )
 from services.task_scheduler import (
@@ -232,7 +234,29 @@ app.add_middleware(
 
 # ==================== 健康检查（免认证：docker healthcheck 依赖） ====================
 @app.get("/health")
-async def health(deep: bool = Query(False)):
+async def health(
+    deep: bool = Query(False),
+    llm_probe: bool = Query(False),
+    health_probe_token: str | None = Header(
+        default=None, alias="X-Health-Probe-Token"
+    ),
+):
+    if llm_probe:
+        configured_probe_token = os.getenv("HEALTH_PROBE_TOKEN", "")
+        if not configured_probe_token:
+            return JSONResponse(
+                content={
+                    "status": "degraded",
+                    "checks": {"llm": "probe_disabled"},
+                },
+                status_code=503,
+            )
+        if not health_probe_token or not hmac.compare_digest(
+            health_probe_token.encode("utf-8"),
+            configured_probe_token.encode("utf-8"),
+        ):
+            raise HTTPException(status_code=403, detail="LLM health probe forbidden")
+
     checks = {}
     healthy = True
 
@@ -266,14 +290,19 @@ async def health(deep: bool = Query(False)):
         checks["embedding"] = f"error: {e}"
         healthy = False
 
-    # LLM (仅 deep=true)
-    if deep:
+    # deep 只验证 provider 配置；显式 llm_probe 才产生真实、可能计费的模型请求。
+    if deep or llm_probe:
         try:
             from services.llm_provider import get_llm_provider
-            await get_llm_provider().chat_completion(
-                [{"role": "user", "content": "ping"}], temperature=0, max_tokens=5
-            )
-            checks["llm"] = "ok"
+            provider = get_llm_provider()
+            checks["llm"] = "configured"
+            if llm_probe:
+                await provider.chat_completion(
+                    [{"role": "user", "content": "ping"}],
+                    temperature=0,
+                    max_tokens=5,
+                )
+                checks["llm"] = "ok"
         except Exception as e:
             checks["llm"] = f"error: {e}"
             healthy = False
@@ -307,15 +336,16 @@ async def disclosure_parameters():
     版本号与调参数值引用 models.schemas / services.recommend 常量（唯一权威源），
     参数变更时只改常量并递增 DISCLOSURE_VERSION。
     """
+    rerank_mode = get_recommend_rerank_mode()
     return DisclosureParameters(
         version=DISCLOSURE_VERSION,
-        last_updated="2026-08-21",
+        last_updated="2026-08-24",
         system_name="joytag",
         description="Joytag 为 Joybuy 欧洲站商品标题生成本地化长尾标签推荐，供站内搜索召回使用（平台功能支持型推荐系统）。",
         input_signals=[
             DisclosureParameter(
                 key="product_title",
-                description="商品标题（自然语言）。发送 LLM 前经 Presidio 假名化，不落完整日志。",
+                description="商品标题（自然语言）。默认仅在本地生成向量；启用 LLM 精排时，经 Presidio 假名化后才发送外部模型，且不落完整日志。",
                 relative_importance="首要信号：决定候选标签的语义召回范围。",
             ),
             DisclosureParameter(
@@ -333,8 +363,14 @@ async def disclosure_parameters():
             DisclosureParameter(
                 key="vector_similarity",
                 description="标题向量与标签向量的余弦相似度（GTE 多语言模型，768 维，本地推理）。",
-                relative_importance=f"第一级排序：召回 top-{TOP_K_RECALL} 候选。",
-                values={"model": "Alibaba-NLP/gte-multilingual-base", "dim": 768, "top_n": TOP_K_RECALL},
+                relative_importance=f"默认排序依据：召回 top-{TOP_K_RECALL} 候选并按相似度返回 top-k。",
+                values={
+                    "model": "Alibaba-NLP/gte-multilingual-base",
+                    "dim": 768,
+                    "top_n": TOP_K_RECALL,
+                    "default_ranking_mode": "vector",
+                    "configured_ranking_mode": rerank_mode,
+                },
             ),
             DisclosureParameter(
                 key="anchor_match_threshold",
@@ -347,14 +383,19 @@ async def disclosure_parameters():
             ),
             DisclosureParameter(
                 key="llm_rerank",
-                description=f"LLM 精排：在 top-{RERANK_DEPTH} 候选中综合语义匹配、文化合规、趋势热度、去重选出 top-k。",
-                relative_importance="第二级排序：决定最终展示顺序与推荐理由文本。",
-                values={"provider": "LLM_PROVIDER env 配置（默认 deepseek-chat）", "temperature": 0.2, "top_n": RERANK_DEPTH},
+                description=f"可选 LLM 精排：仅当服务端配置为 llm 时，在 top-{RERANK_DEPTH} 候选中综合语义匹配、文化合规、趋势热度和去重选出 top-k。",
+                relative_importance="默认关闭；启用后作为第二级排序并生成推荐理由。",
+                values={
+                    "provider": "LLM_PROVIDER env 配置（默认 deepseek-chat）",
+                    "temperature": 0.2,
+                    "top_n": RERANK_DEPTH,
+                    "configured_mode": rerank_mode,
+                },
             ),
             DisclosureParameter(
                 key="trend_score",
                 description="标签采集时的趋势热度分（来源平台热度归一化）。",
-                relative_importance="精排参考因子：同语义下热度高者优先。",
+                relative_importance="默认向量模式仅作解释元数据；启用 LLM 精排时作为参考因子。",
             ),
         ],
         compliance_filters=[
@@ -387,7 +428,7 @@ async def disclosure_parameters():
             ),
             DisclosureParameter(
                 key="llm_assessment",
-                description="LLM 动态种子翻译 + 文化合规评估（规则库优先，规则未命中才调用 LLM）。海外词锚点匹配不调用翻译 LLM。",
+                description="LLM 动态种子翻译 + 文化合规评估（规则库优先；无中文锚点直接进入人工审核；仅有锚点且规则未命中时调用 LLM）。海外词锚点匹配不调用翻译 LLM。",
                 relative_importance="决定标签合规状态（可复用/需拦截/存疑）。",
             ),
             DisclosureParameter(
@@ -399,8 +440,8 @@ async def disclosure_parameters():
         ai_involvement=[
             DisclosureParameter(
                 key="llm_rerank",
-                description="推荐排序由 LLM 完成（AI Act Art.50 披露）。",
-                relative_importance="每条推荐带 ai_generated 标记；LLM 不可用时回退纯向量排序（ai_generated=false）。",
+                description="推荐默认由本地向量排序；服务端可选择启用 LLM 精排（AI Act Art.50 披露）。",
+                relative_importance="每条推荐带 ai_generated 标记；向量模式或 LLM 回退结果为 false。",
             ),
             DisclosureParameter(
                 key="llm_assessment",
@@ -441,13 +482,14 @@ async def recommend_tags(request: Request, req: RecommendRequest,
                          _scope=Depends(require_scope("joytag:recommend"))):
     """
     根据商品信息推荐本地化 Tag。
-    流程：生成查询向量 → Qdrant 检索 → 业务过滤 → LLM 精排 → 返回附带推荐理由的 Tag 列表。
+    流程：生成查询向量 → Qdrant 检索 → 业务过滤 → 服务端配置的向量/LLM 排序 → 返回 Tag 列表。
     """
+    rerank_mode = get_recommend_rerank_mode()
     # GDPR 最小化：不落完整标题，只记长度 + 哈希前缀（log_safe_hash 共享约定，供排查关联）
     logger.info(
         f"[api] 标签推荐请求: title_len={len(req.title)}, "
         f"title_hash={log_safe_hash(req.title)}, "
-        f"country={req.target_country}"
+        f"country={req.target_country}, mode={rerank_mode}"
     )
     # 1. 构造查询文本
     query_text = req.title
@@ -471,19 +513,24 @@ async def recommend_tags(request: Request, req: RecommendRequest,
         logger.info(f"[api] 标签推荐无候选结果: total={total_candidates}")
         return build_recommend_response([], total_candidates, filtered_count)
 
-    # 4. LLM 精排
-    recommendations = await rerank_tags_with_llm(
-        candidates=filtered,
-        product_title=req.title,
-        product_category=req.category,
-        target_country=req.target_country,
-        max_output=req.top_k
-    )
+    # 4. 默认纯向量排序；只有服务端显式启用 llm 模式才产生外部调用。
+    if rerank_mode == "llm":
+        recommendations = await rerank_tags_with_llm(
+            candidates=filtered,
+            product_title=req.title,
+            product_category=req.category,
+            target_country=req.target_country,
+            max_output=req.top_k,
+        )
+    else:
+        recommendations = rank_tags_by_vector(filtered, req.top_k)
 
     # 5. 构造响应（补全相似度 + provenance 溯源解释字段，DSA Art.27 / AI Act Art.50）
     items = build_recommend_items(recommendations, filtered)
 
-    logger.info(f"[api] 标签推荐完成: 返回 {len(items)} 个推荐")
+    logger.info(
+        f"[api] 标签推荐完成: mode={rerank_mode}, 返回 {len(items)} 个推荐"
+    )
     return build_recommend_response(items, total_candidates, filtered_count)
 
 # ==================== 采集器触发接口 ====================
