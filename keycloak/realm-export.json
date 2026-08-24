@@ -72,6 +72,20 @@
       "serviceAccountsEnabled": true,
       "clientAuthenticatorType": "client-secret",
       "protocol": "openid-connect",
+      "protocolMappers": [
+        {
+          "name": "joytag-service-audience",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-audience-mapper",
+          "consentRequired": false,
+          "config": {
+            "included.client.audience": "joytag-service",
+            "id.token.claim": "false",
+            "access.token.claim": "true",
+            "introspection.token.claim": "true"
+          }
+        }
+      ],
       "defaultClientScopes": ["web-origins", "acr", "profile", "roles", "email"],
       "optionalClientScopes": ["joytag:recommend", "address", "phone", "offline_access", "microprofile-jwt"]
     }

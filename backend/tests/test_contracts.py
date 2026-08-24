@@ -1,4 +1,6 @@
+import json
 import unittest
+from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 from pydantic import ValidationError
@@ -13,6 +15,30 @@ from services.recommend import (
 
 def _candidate(word: str, similarity: float, **metadata):
     return {"word": word, "similarity": similarity, **metadata}
+
+
+class KeycloakRealmContractTests(unittest.TestCase):
+    def test_service_token_includes_backend_audience(self):
+        realm_path = Path(__file__).resolve().parents[2] / "keycloak" / "realm-export.json"
+        realm = json.loads(realm_path.read_text(encoding="utf-8"))
+        service_client = next(
+            client
+            for client in realm["clients"]
+            if client.get("clientId") == "joytag-service"
+        )
+        audience_mapper = next(
+            mapper
+            for mapper in service_client.get("protocolMappers", [])
+            if mapper.get("protocolMapper") == "oidc-audience-mapper"
+        )
+
+        self.assertEqual(audience_mapper.get("protocol"), "openid-connect")
+        self.assertEqual(
+            audience_mapper["config"].get("included.client.audience"),
+            "joytag-service",
+        )
+        self.assertEqual(audience_mapper["config"].get("access.token.claim"), "true")
+        self.assertEqual(audience_mapper["config"].get("id.token.claim"), "false")
 
 
 class RecommendSchemaTests(unittest.TestCase):

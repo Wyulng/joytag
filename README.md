@@ -160,7 +160,7 @@ docker compose ps
 
 ### `POST /v1/tag/recommend`
 
-服务间调用需要 Keycloak Bearer token，并包含 `joytag:recommend` scope；默认限流为每个客户端 IP 每分钟 20 次。请求中的 `title` 长度为 1-500，`category` 最长 100，`top_k` 取值 1-10，`target_country` 会规范化为大写并限制为六个支持国家。
+服务间调用需要 Keycloak Bearer token，并同时包含 `aud=joytag-service` 与 `joytag:recommend` scope；realm 中的固定 Audience mapper 负责写入该 audience。默认限流为每个客户端 IP 每分钟 20 次。请求中的 `title` 长度为 1-500，`category` 最长 100，`top_k` 取值 1-10，`target_country` 会规范化为大写并限制为六个支持国家。
 
 请求示例：
 
