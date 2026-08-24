@@ -3,12 +3,14 @@ import json
 import uuid
 import asyncio
 import logging
+import hashlib
 from pathlib import Path
 from datetime import datetime, timezone
 from services.alignment import process_overseas_word
 from services.collectors.countries import EU_COUNTRIES
 from services.collectors import amazon_suggest, ebay_suggest, seed_builder
-from services.qdrant_store import local_tag_exists
+from services.embedding import get_embeddings
+from services.qdrant_store import get_existing_word_decision
 from services.lineage import record_event, EVENT_START, EVENT_COMPLETE, EVENT_FAIL
 
 logger = logging.getLogger(__name__)
@@ -90,17 +92,26 @@ def _merge_sources(
 async def _fetch_pair(country: str, seeds: list[tuple[str, str | None]]):
     """单国双源并行抓取；单源超时/失败降级 []，不拖垮整国。
 
-    max_workers=8 与旧单国 executor 并发档一致（6 国 × 2 源并行任务共 12 个
-    executor，控制对 Amazon/eBay 的总并发上限）；单国粒度下 wait_for 超时后的
-    孤儿线程最多再跑 ~2 批（约 20s），而非旧的六国串行 ~140s。
+    Amazon/eBay 的 fanout_fetch 共用固定 16 worker 线程池；单国粒度下
+    wait_for 超时后的孤儿线程最多再跑约 2 批，而不会为每个国家重复创建线程池。
     """
     amz, ebay = await asyncio.gather(
         asyncio.wait_for(
-            asyncio.to_thread(amazon_suggest.get_amazon_suggest_words, [country], {country: seeds}, 8),
+            asyncio.to_thread(
+                amazon_suggest.get_amazon_suggest_words,
+                [country],
+                {country: seeds},
+                amazon_suggest.OVERSEAS_FETCH_WORKERS,
+            ),
             timeout=_SOURCE_TIMEOUT,
         ),
         asyncio.wait_for(
-            asyncio.to_thread(ebay_suggest.get_ebay_suggest_words, [country], {country: seeds}, 8),
+            asyncio.to_thread(
+                ebay_suggest.get_ebay_suggest_words,
+                [country],
+                {country: seeds},
+                amazon_suggest.OVERSEAS_FETCH_WORKERS,
+            ),
             timeout=_SOURCE_TIMEOUT,
         ),
         return_exceptions=True,
@@ -214,6 +225,24 @@ async def _collect_overseas_generator():
     save_counter = 0
 
     try:
+        # 在任何向量化之前读取三类 Qdrant 决策缓存。缓存命中的词不再执行
+        # embedding、锚点搜索、规则检查或 LLM；无缓存的新词按原顺序批量编码。
+        decisions_by_key: dict[str, dict | None] = {}
+        words_to_encode: list[str] = []
+        words_to_encode_set: set[str] = set()
+        for word, country, _category, _trend_score, _source in unprocessed:
+            key = f"{word}:{country}"
+            if key in decisions_by_key:
+                continue
+            decision = get_existing_word_decision(word, country)
+            decisions_by_key[key] = decision
+            if decision is None and word not in words_to_encode_set:
+                words_to_encode.append(word)
+                words_to_encode_set.add(word)
+
+        vectors = await get_embeddings(words_to_encode) if words_to_encode else []
+        vectors_by_word = dict(zip(words_to_encode, vectors))
+
         for i, (word, country, category, trend_score, source) in enumerate(trends):
             key = f"{word}:{country}"
 
@@ -232,11 +261,18 @@ async def _collect_overseas_generator():
                 }
                 continue
 
-            # 检查数据库是否已存在
-            exists_in_db = local_tag_exists(word, country)
+            # 统一缓存中任一决策都视为重复，且不增加本轮新增状态统计。
+            cached_decision = decisions_by_key.get(key)
+            exists_in_db = cached_decision is not None
 
             if exists_in_db:
                 duplicate_count += 1
+                logger.info(
+                    "[overseas] decision_cache_hit country=%s status=%s word_sha256=%s",
+                    country,
+                    cached_decision.get("action"),
+                    hashlib.sha256(word.encode("utf-8")).hexdigest(),
+                )
             else:
                 result = await process_overseas_word(
                     word=word,
@@ -244,9 +280,18 @@ async def _collect_overseas_generator():
                     category=category,
                     trend_score=trend_score,
                     source=source,
-                    collection_run_id=run_id
+                    collection_run_id=run_id,
+                    query_vector=vectors_by_word[word],
+                    existing_decision=None,
                 )
                 action = result.get("action")
+                # 同一轮候选可能跨种子重复出现；把本次新决策放入内存缓存，
+                # 保持原有单轮幂等性，后续重复词只计 duplicate。
+                decisions_by_key[key] = {
+                    "action": action,
+                    "status": result.get("status"),
+                    "stored": result.get("stored", False),
+                }
                 if action == "approved":
                     approved_count += 1
                     new_count += 1

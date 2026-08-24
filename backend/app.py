@@ -203,6 +203,10 @@ async def lifespan(app: FastAPI):
     yield
     logger.info("[app] 关闭应用，清理调度器...")
     shutdown_scheduler()
+    # Amazon/eBay 共用的采集线程池在应用生命周期结束时显式释放；
+    # 下一轮采集会按需重新初始化，避免线程泄漏影响热重载和测试。
+    from services.collectors.amazon_suggest import close_fetch_executor
+    close_fetch_executor()
     await close_http_client()
 
 app = FastAPI(title="Joytag API", version="2.0.0", lifespan=lifespan)

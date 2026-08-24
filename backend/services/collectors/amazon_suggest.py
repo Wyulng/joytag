@@ -87,6 +87,34 @@ SEEDS_BY_COUNTRY: dict[str, list[tuple[str, str | None]]] = {
 MAX_WORDS_PER_COUNTRY = 50
 _HOT_CACHE_TTL_SECONDS = 600  # 推荐接口热词上下文缓存 10 分钟
 
+# Amazon/eBay 共用一个有界线程池。此前每个国家和来源都会创建独立线程池，
+# 六国双源同时运行时可能产生约 96 个 worker；统一池将网络请求并发固定为 16。
+OVERSEAS_FETCH_WORKERS = 16
+_FETCH_EXECUTOR: ThreadPoolExecutor | None = None
+_FETCH_EXECUTOR_LOCK = threading.Lock()
+
+
+def _get_fetch_executor() -> ThreadPoolExecutor:
+    """延迟创建 Amazon/eBay 共用的海外建议词线程池。"""
+    global _FETCH_EXECUTOR
+    with _FETCH_EXECUTOR_LOCK:
+        if _FETCH_EXECUTOR is None:
+            _FETCH_EXECUTOR = ThreadPoolExecutor(
+                max_workers=OVERSEAS_FETCH_WORKERS,
+                thread_name_prefix="overseas-suggest",
+            )
+        return _FETCH_EXECUTOR
+
+
+def close_fetch_executor() -> None:
+    """关闭共享采集线程池；应用重启或测试下一轮采集时可再次延迟创建。"""
+    global _FETCH_EXECUTOR
+    with _FETCH_EXECUTOR_LOCK:
+        executor = _FETCH_EXECUTOR
+        _FETCH_EXECUTOR = None
+    if executor is not None:
+        executor.shutdown(wait=True, cancel_futures=True)
+
 
 def _fetch_suggestions(country: str, seed: str, seed_category: str | None) -> list[tuple[str, int, str | None]]:
     """获取单个种子的 Amazon 搜索建议。返回 list[(词, 排名, 种子类目)]。"""
@@ -153,14 +181,14 @@ def fanout_fetch(
     seeds_by_country: dict[str, list[tuple[str, str | None]]],
     fetch_fn,
     source_name: str,
-    max_workers: int = 32,
+    max_workers: int = OVERSEAS_FETCH_WORKERS,
     fallback_seeds: dict[str, list[tuple[str, str | None]]] | None = None,
 ) -> list[dict]:
-    """跨国扁平扇出（amazon/ebay 共用）：单个 executor 覆盖全部 (国家, 种子) 对。
+    """跨国扁平扇出（amazon/ebay 共用）：共享 executor 覆盖全部 (国家, 种子) 对。
 
-    替代原「六国 for 串行 + 每国短命 ThreadPoolExecutor(8)」——全并发下最坏耗时为
-    单批超时而非逐国累加。结果按 (trend_score 降序, query 升序) 确定性排序，
-    每国截断 MAX_WORDS_PER_COUNTRY，保证「进度切片确定性」注释成立。
+    max_workers 参数保留以兼容现有内部调用，但实际并发由
+    OVERSEAS_FETCH_WORKERS 固定控制。结果按 (trend_score 降序, query 升序)
+    确定性排序，每国截断 MAX_WORDS_PER_COUNTRY，保证进度切片确定性。
     """
     fallback_seeds = fallback_seeds if fallback_seeds is not None else {}
     jobs: list[tuple[str, str, str | None]] = []
@@ -168,15 +196,25 @@ def fanout_fetch(
         seeds = seeds_by_country.get(c) or fallback_seeds.get(c) or []
         jobs.extend((c, s, cat) for s, cat in seeds)
 
+    if not jobs:
+        return []
+
     by_country: dict[str, list[tuple[str, int, str | None]]] = {c: [] for c in countries}
-    with ThreadPoolExecutor(max_workers=max_workers) as ex:
-        futures = {ex.submit(fetch_fn, c, s, cat): (c, s) for c, s, cat in jobs}
-        for future in as_completed(futures):
-            country, _ = futures[future]
-            try:
-                by_country[country].extend(future.result())
-            except Exception as e:
-                logger.debug(f"[{source_name}] 扇出任务异常: {e}")
+    if max_workers != OVERSEAS_FETCH_WORKERS:
+        logger.debug(
+            "[%s] 忽略调用方 max_workers=%s，使用全局上限 %s",
+            source_name,
+            max_workers,
+            OVERSEAS_FETCH_WORKERS,
+        )
+    executor = _get_fetch_executor()
+    futures = {executor.submit(fetch_fn, c, s, cat): (c, s) for c, s, cat in jobs}
+    for future in as_completed(futures):
+        country, _ = futures[future]
+        try:
+            by_country[country].extend(future.result())
+        except Exception as e:
+            logger.debug(f"[{source_name}] 扇出任务异常: {e}")
 
     results = []
     for c in countries:
@@ -196,12 +234,12 @@ def fanout_fetch(
 def get_amazon_suggest_words(
     countries: list[str] | None = None,
     seeds_by_country: dict[str, list[tuple[str, str | None]]] | None = None,
-    max_workers: int = 32,
+    max_workers: int = OVERSEAS_FETCH_WORKERS,
 ) -> list[dict]:
     """获取六国 Amazon 搜索建议词（动态种子优先，缺省国家回退固定种子表）。
 
     返回 [{"query", "country", "trend_score", "category", "source"}]，每国 ≤50。
-    max_workers 供逐国流水线调用方控制总并发（如 overseas_trends 传 8）。
+    max_workers 仅为兼容旧调用方保留，实际使用固定全局线程池上限。
     """
     if countries is None:
         countries = EU_COUNTRIES

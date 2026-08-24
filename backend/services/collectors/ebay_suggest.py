@@ -11,7 +11,11 @@ import logging
 import requests
 
 from services.collectors.countries import EU_COUNTRIES
-from services.collectors.amazon_suggest import SEEDS_BY_COUNTRY, fanout_fetch
+from services.collectors.amazon_suggest import (
+    OVERSEAS_FETCH_WORKERS,
+    SEEDS_BY_COUNTRY,
+    fanout_fetch,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -58,13 +62,13 @@ def _fetch_suggestions(country: str, seed: str, seed_category: str | None) -> li
 def get_ebay_suggest_words(
     countries: list[str] | None = None,
     seeds_by_country: dict[str, list[tuple[str, str | None]]] | None = None,
-    max_workers: int = 32,
+    max_workers: int = OVERSEAS_FETCH_WORKERS,
 ) -> list[dict]:
     """获取六国 eBay 搜索建议词（动态种子优先，缺省国家回退固定种子表）。
 
     扇出/评分/确定性排序/截断复用 amazon_suggest.fanout_fetch（与 Amazon 侧
     行为保持一致）。返回 [{"query", "country", "trend_score", "category", "source"}]。
-    max_workers 供逐国流水线调用方控制总并发（如 overseas_trends 传 8）。
+    max_workers 仅为兼容旧调用方保留，实际使用固定全局线程池上限。
     """
     if countries is None:
         countries = EU_COUNTRIES

@@ -7,6 +7,7 @@ from pathlib import Path
 from datetime import datetime, timezone
 from services.alignment import process_cn_longtail_word
 from services.collectors.cn_ecommerce import get_cn_trending_words
+from services.embedding import get_embeddings
 from services.qdrant_store import cn_anchor_exists
 from services.lineage import record_event, EVENT_START, EVENT_COMPLETE, EVENT_FAIL
 
@@ -94,6 +95,20 @@ async def _collect_cn_generator():
     save_counter = 0
 
     try:
+        # 先完成数据库去重，再为本轮真正需要入库的新词批量编码。
+        # dict 保留原始顺序，并避免同一轮重复词被重复编码。
+        exists_by_word: dict[str, bool] = {}
+        new_words: list[str] = []
+        for cn_word in unprocessed:
+            if cn_word in exists_by_word:
+                continue
+            exists_in_db = cn_anchor_exists(cn_word)
+            exists_by_word[cn_word] = exists_in_db
+            if not exists_in_db:
+                new_words.append(cn_word)
+        vectors = await get_embeddings(new_words) if new_words else []
+        vectors_by_word = dict(zip(new_words, vectors))
+
         for i, (cn_word, heat, seed_category) in enumerate(words_with_heat):
             # 跳过已处理的词
             if cn_word in processed_words:
@@ -107,8 +122,9 @@ async def _collect_cn_generator():
                 }
                 continue
 
-            # 检查数据库是否已存在
-            exists_in_db = cn_anchor_exists(cn_word)
+            # 使用批处理前完成的去重结果；前序重复词入库后更新状态，
+            # 保持原有逐词顺序下的幂等语义。
+            exists_in_db = exists_by_word.get(cn_word, False)
 
             if exists_in_db:
                 # 词已在数据库中
@@ -123,9 +139,11 @@ async def _collect_cn_generator():
                         "collection_run_id": run_id,
                         "collected_at": datetime.now(timezone.utc).isoformat(),
                     },
-                    collection_run_id=run_id
+                    collection_run_id=run_id,
+                    vector=vectors_by_word[cn_word],
                 )
                 new_count += 1
+                exists_by_word[cn_word] = True
 
             # 更新进度（每 _SAVE_INTERVAL 次写一次磁盘）
             processed_words[cn_word] = None
