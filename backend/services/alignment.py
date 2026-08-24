@@ -1,4 +1,5 @@
 import logging
+import hashlib
 from datetime import datetime, timezone
 from services.llm import assess_single
 from services.embedding import get_embedding
@@ -8,11 +9,13 @@ from services.qdrant_store import (
     upsert_local_tag,
     insert_pending_review,
     insert_blocked_decision,
-    search_cn_anchor_by_word
+    search_cn_anchor_by_word,
+    get_existing_word_decision,
 )
 from services.lineage import record_event, EVENT_OUTPUT
 
 logger = logging.getLogger(__name__)
+_DECISION_UNCHECKED = object()
 
 
 def _record_word_lineage(run_id: str, job_name: str, collection: str, word: str, country: str | None,
@@ -33,7 +36,8 @@ def _record_word_lineage(run_id: str, job_name: str, collection: str, word: str,
 
 # ==================== 处理中文长尾词（底座建设） ====================
 async def process_cn_longtail_word(cn_word: str, category: str = None,
-                                   provenance: dict = None, collection_run_id: str = None):
+                                   provenance: dict = None, collection_run_id: str = None,
+                                   vector: list[float] | None = None):
     """
     处理中文长尾词（纯概念底座，不做翻译）：
     1. 生成中文原文向量
@@ -42,7 +46,7 @@ async def process_cn_longtail_word(cn_word: str, category: str = None,
     """
     logger.info(f"[alignment] 处理中文长尾词: {cn_word}")
     # 生成中文原文向量
-    vector = await get_embedding(cn_word)
+    vector = vector if vector is not None else await get_embedding(cn_word)
 
     # 存入中文锚点库
     anchor_id = upsert_cn_anchor(cn_word, vector, category=category, provenance=provenance)
@@ -56,7 +60,9 @@ async def process_cn_longtail_word(cn_word: str, category: str = None,
 # ==================== 处理海外趋势词（最终输出源） ====================
 async def process_overseas_word(word: str, country: str, anchor_cn_id: str = None,
                                 category: str = None, trend_score: float = 0.0,
-                                source: str = "overseas", collection_run_id: str = None):
+                                source: str = "overseas", collection_run_id: str = None,
+                                query_vector: list[float] | None = None,
+                                existing_decision: dict | None | object = _DECISION_UNCHECKED):
     """
     处理海外趋势词（本地化词汇）：
     1. 使用 GTE 多语言向量直接查找对应的中文锚点
@@ -66,14 +72,49 @@ async def process_overseas_word(word: str, country: str, anchor_cn_id: str = Non
     5. 存疑 → 写入 pending_review 队列
     6. 需拦截 → 持久化到 blocked_decisions（UCPD/GDPR 决策留痕，不再丢弃）
     """
-    logger.info(f"[alignment] 处理海外词: {word} ({country}, source={source})")
+    word_hash = hashlib.sha256(word.encode("utf-8")).hexdigest()
+    logger.info(
+        "[alignment] 处理海外词: word_sha256=%s country=%s source=%s",
+        word_hash,
+        country,
+        source,
+    )
+    # 直接调用时必须检查统一决策缓存；批量采集器传入 None 表示已经完成
+    # 预检查，避免同一词在本轮内重复读取 Qdrant。
+    if existing_decision is _DECISION_UNCHECKED:
+        existing_decision = get_existing_word_decision(word, country)
+    if existing_decision:
+        payload = existing_decision.get("payload") or {}
+        cached_result = {
+            "stored": existing_decision.get("stored", False),
+            "action": existing_decision.get("action"),
+            "status": existing_decision.get("status"),
+            "reason": payload.get("reason") or payload.get("assessment_reason") or "已有决策记录",
+            "anchor_cn_word": payload.get("anchor_cn_word") or payload.get("cn_word"),
+            "cache_hit": True,
+            "decision_collection": existing_decision.get("collection"),
+        }
+        if existing_decision.get("action") == "approved":
+            cached_result["id"] = existing_decision.get("id")
+        elif existing_decision.get("action") == "pending":
+            cached_result["pending_id"] = existing_decision.get("id")
+        else:
+            cached_result["blocked_id"] = existing_decision.get("id")
+        logger.info(
+            "[alignment] 命中海外词决策缓存: country=%s, status=%s, collection=%s",
+            country,
+            existing_decision.get("action"),
+            existing_decision.get("collection"),
+        )
+        return cached_result
+
     provenance = {
         "source_type": source,
         "collection_run_id": collection_run_id,
         "collected_at": datetime.now(timezone.utc).isoformat(),
     }
     # 第0步：直接使用多语言向量查找中文锚点，避免每个海外词额外调用翻译 LLM
-    query_vector = await get_embedding(word)
+    query_vector = query_vector if query_vector is not None else await get_embedding(word)
     anchor_info = search_cn_anchor_by_word(word, query_vector, category=category)
 
     resolved_anchor_cn_id = anchor_info["id"] if anchor_info else None

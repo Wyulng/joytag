@@ -17,6 +17,7 @@ EMBEDDING_MODEL_REVISION = os.getenv(
     "9bbca17d9273fd0d03d5725c7a4b0f6b45142062",
 )
 EMBEDDING_DIM = 768
+EMBEDDING_BATCH_SIZE = 32
 EMBEDDING_NORMALIZE = os.getenv("EMBEDDING_NORMALIZE", "true").strip().lower() not in {
     "0", "false", "no", "off"
 }
@@ -164,5 +165,56 @@ async def get_embedding(text: str) -> list[float]:
         return vector
     except Exception as e:
         logger.error("[embedding] 向量推理失败: %s", e)
+        from fastapi import HTTPException
+        raise HTTPException(status_code=503, detail="向量服务暂不可用，请稍后重试")
+
+
+async def get_embeddings(
+    texts: list[str],
+    batch_size: int = EMBEDDING_BATCH_SIZE,
+) -> list[list[float]]:
+    """批量生成 GTE 向量，保持输入顺序并限制单批内存占用。"""
+    if not texts:
+        return []
+    if batch_size <= 0:
+        raise ValueError("embedding batch_size must be greater than zero")
+    for text in texts:
+        if not isinstance(text, str) or not text.strip():
+            raise ValueError("embedding text must not be empty")
+
+    model = await asyncio.to_thread(_get_model)
+    vectors: list[list[float]] = []
+    try:
+        # 显式拆批，确保 65 个词确实只触发 ceil(65 / 32) 次模型批处理，
+        # 同时不把整轮采集的文本一次性交给模型。
+        for start in range(0, len(texts), batch_size):
+            batch = texts[start:start + batch_size]
+            raw_batch = await asyncio.to_thread(
+                lambda batch=batch: model.encode(
+                    batch,
+                    batch_size=batch_size,
+                    normalize_embeddings=EMBEDDING_NORMALIZE,
+                    convert_to_numpy=True,
+                ).tolist()
+            )
+            if len(raw_batch) != len(batch):
+                raise ValueError(
+                    f"embedding batch result mismatch: expected {len(batch)}, got {len(raw_batch)}"
+                )
+            for raw_vector in raw_batch:
+                vector = [float(value) for value in raw_vector]
+                if len(vector) != EMBEDDING_DIM:
+                    raise ValueError(
+                        f"embedding dimension mismatch: expected {EMBEDDING_DIM}, got {len(vector)}"
+                    )
+                norm = math.sqrt(sum(value * value for value in vector))
+                if norm == 0:
+                    raise ValueError("embedding vector norm must not be zero")
+                if EMBEDDING_NORMALIZE:
+                    vector = [value / norm for value in vector]
+                vectors.append(vector)
+        return vectors
+    except Exception as e:
+        logger.error("[embedding] 批量向量推理失败: %s", e)
         from fastapi import HTTPException
         raise HTTPException(status_code=503, detail="向量服务暂不可用，请稍后重试")

@@ -11,13 +11,14 @@ import asyncio
 import json
 import logging
 import threading
+from datetime import datetime, timezone
 from pathlib import Path
 
 from filelock import FileLock
 
 from services.collectors.countries import EU_COUNTRIES, LANGUAGE_NAMES
 from services.llm import translate_chinese_to_foreign_batch, TRANSLATE_BATCH_SIZE
-from services.qdrant_store import ANCHOR_COLLECTION, _scroll_all
+from services.qdrant_store import ANCHOR_COLLECTION, _iter_scroll
 
 logger = logging.getLogger(__name__)
 
@@ -79,17 +80,33 @@ def get_recent_anchor_words(limit: int = _RECENT_ANCHOR_LIMIT) -> list[tuple[str
 
     重复 upsert 会刷新 created_at，因此最新 = 最近活跃锚点，语义符合种子诉求。
     """
-    # 分批分页 scroll 全量锚点（单页 1000 上限会静默排除新锚点，见 qdrant_store._scroll_all）
-    records = _scroll_all(
+    if limit <= 0:
+        return []
+
+    def sort_timestamp(value: str) -> float:
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            return parsed.timestamp()
+        except (AttributeError, TypeError, ValueError, OverflowError):
+            return float("-inf")
+
+    # 只保留当前已见记录中的前 limit 个，不物化整个 cn_anchors 集合。
+    recent: list[tuple[str, str | None, str]] = []
+    for record in _iter_scroll(
         ANCHOR_COLLECTION,
         payload_keys=["cn_word", "category", "created_at"],
-    )
-    items = [
-        (r.payload.get("cn_word"), r.payload.get("category"), r.payload.get("created_at") or "")
-        for r in records if r.payload.get("cn_word")
-    ]
-    items.sort(key=lambda x: x[2], reverse=True)
-    return [(w, c) for w, c, _ in items[:limit]]
+    ):
+        payload = record.payload or {}
+        word = payload.get("cn_word")
+        if not word:
+            continue
+        recent.append((word, payload.get("category"), payload.get("created_at") or ""))
+        recent.sort(key=lambda item: (-sort_timestamp(item[2]), item[0]))
+        if len(recent) > limit:
+            recent.pop()
+    return [(word, category) for word, category, _ in recent]
 
 
 async def iter_country_seeds(countries: list[str] | None = None):

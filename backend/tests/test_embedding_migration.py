@@ -48,6 +48,7 @@ class EmbeddingMigrationTests(unittest.IsolatedAsyncioTestCase):
         vector = [0.25] * VECTOR_SIZE
         assess = AsyncMock(return_value=("可复用", "通过", None, None))
         with (
+            patch.object(alignment, "get_existing_word_decision", return_value=None),
             patch.object(alignment, "get_embedding", new=AsyncMock(return_value=vector)) as embed,
             patch.object(
                 alignment,
@@ -79,6 +80,7 @@ class EmbeddingMigrationTests(unittest.IsolatedAsyncioTestCase):
     async def test_anchor_safe_rule_skips_assessment_and_records_rule_source(self):
         assess = AsyncMock()
         with (
+            patch.object(alignment, "get_existing_word_decision", return_value=None),
             patch.object(
                 alignment,
                 "get_embedding",
@@ -109,6 +111,7 @@ class EmbeddingMigrationTests(unittest.IsolatedAsyncioTestCase):
         assess = AsyncMock()
         rule_check = MagicMock(return_value=(None, "", None))
         with (
+            patch.object(alignment, "get_existing_word_decision", return_value=None),
             patch.object(alignment, "get_embedding", new=AsyncMock(return_value=vector)),
             patch.object(alignment, "search_cn_anchor_by_word", return_value=None),
             patch.object(
@@ -134,6 +137,7 @@ class EmbeddingMigrationTests(unittest.IsolatedAsyncioTestCase):
     async def test_no_anchor_banned_rule_blocks_without_llm(self):
         assess = AsyncMock()
         with (
+            patch.object(alignment, "get_existing_word_decision", return_value=None),
             patch.object(
                 alignment,
                 "get_embedding",
@@ -164,6 +168,7 @@ class EmbeddingMigrationTests(unittest.IsolatedAsyncioTestCase):
     async def test_no_anchor_safe_rule_still_requires_manual_anchor(self):
         assess = AsyncMock()
         with (
+            patch.object(alignment, "get_existing_word_decision", return_value=None),
             patch.object(
                 alignment,
                 "get_embedding",

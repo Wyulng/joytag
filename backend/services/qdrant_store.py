@@ -4,6 +4,7 @@ from uuid import UUID
 import hashlib
 import logging
 from datetime import datetime, timezone
+from typing import Iterator
 from qdrant_client import QdrantClient
 
 logger = logging.getLogger(__name__)
@@ -98,15 +99,14 @@ def get_qdrant_client():
     return _client
 
 
-def _scroll_all(
+def _iter_scroll(
     collection_name: str,
     filter_condition: Filter = None,
     payload_keys: list[str] = None,
     batch_size: int = 1000,
-) -> list:
-    """分批滚动查询所有匹配记录，避免单次 limit 过大导致 Qdrant OOM。"""
+) -> Iterator:
+    """分页流式读取 Qdrant 记录，每次只保留当前页。"""
     client = get_qdrant_client()
-    all_records = []
     next_offset = None
     while True:
         records, next_offset = client.scroll(
@@ -117,10 +117,24 @@ def _scroll_all(
             with_payload=True if payload_keys is None else payload_keys,
             with_vectors=False,
         )
-        all_records.extend(records)
+        yield from records
         if next_offset is None:
             break
-    return all_records
+
+
+def _scroll_all(
+    collection_name: str,
+    filter_condition: Filter = None,
+    payload_keys: list[str] = None,
+    batch_size: int = 1000,
+) -> list:
+    """兼容接口：物化完整结果；需要流式处理时使用 _iter_scroll。"""
+    return list(_iter_scroll(
+        collection_name=collection_name,
+        filter_condition=filter_condition,
+        payload_keys=payload_keys,
+        batch_size=batch_size,
+    ))
 
 # ==================== 中文锚点操作 ====================
 def upsert_cn_anchor(cn_word: str, vector: list[float], category: str = None,
@@ -376,13 +390,15 @@ def get_dashboard_stats() -> dict:
     # 扫描 local_tags 获取有数据的国家数（只读 country 字段，不读向量）
     distinct_countries = 0
     try:
-        records = _scroll_all(
+        countries = set()
+        for record in _iter_scroll(
             collection_name=LOCAL_COLLECTION,
             payload_keys=["country"],
-        )
-        distinct_countries = len(
-            set(r.payload.get("country") for r in records if r.payload.get("country"))
-        )
+        ):
+            country = (record.payload or {}).get("country")
+            if country:
+                countries.add(country)
+        distinct_countries = len(countries)
     except Exception as exc:
         logger.warning("[qdrant] 统计国家数失败: %s", exc)
 
@@ -427,7 +443,7 @@ def batch_count_linked_local_tags(anchor_ids: list[str]) -> dict[str, int]:
     if not anchor_ids:
         return {}
     try:
-        records = _scroll_all(
+        records = _iter_scroll(
             collection_name=LOCAL_COLLECTION,
             filter_condition=Filter(should=[
                 FieldCondition(key="anchor_cn_id", match=MatchValue(value=aid))
@@ -441,7 +457,7 @@ def batch_count_linked_local_tags(anchor_ids: list[str]) -> dict[str, int]:
 
     counts = {aid: 0 for aid in anchor_ids}
     for r in records:
-        aid = r.payload.get("anchor_cn_id")
+        aid = (r.payload or {}).get("anchor_cn_id")
         if aid in counts:
             counts[aid] += 1
     return counts
@@ -769,14 +785,16 @@ def delete_points_by_word(word: str, country: str = None) -> int:
         if country and collection != ANCHOR_COLLECTION:
             conditions.append(FieldCondition(key="country", match=MatchValue(value=country)))
         filter_condition = Filter(must=conditions)
-        matching = _scroll_all(collection, filter_condition, payload_keys=[word_field])
+        matching_count = sum(
+            1 for _ in _iter_scroll(collection, filter_condition, payload_keys=[word_field])
+        )
         result = client.delete(
             collection_name=collection,
             points_selector=FilterSelector(filter=filter_condition)
         )
         # Qdrant returns UpdateResult, not the deleted points. Count the
         # matching records before issuing the hard-delete operation.
-        deleted += len(matching)
+        deleted += matching_count
     logger.info(f"[qdrant] DSAR 硬删除: word={word}, country={country}, deleted={deleted}")
     return deleted
 
@@ -793,3 +811,31 @@ def get_point(collection: str, point_id: str) -> dict | None:
     if not points:
         return None
     return {"id": points[0].id, "payload": points[0].payload}
+
+
+def get_existing_word_decision(word: str, country: str) -> dict | None:
+    """按确定性自然键读取已有海外词决策，避免重复向量化和评估。
+
+    决策优先级固定为 blocked → local_tags → pending_review。该查询只做
+    三次 point retrieve，不进行向量搜索；管理员删除对应记录即可使缓存失效。
+    """
+    point_id = _generate_deterministic_id(word, country)
+    candidates = (
+        (BLOCKED_COLLECTION, "blocked", "需拦截", False),
+        (LOCAL_COLLECTION, "approved", "可复用", True),
+        (PENDING_COLLECTION, "pending", "存疑", False),
+    )
+    for collection, action, default_status, stored in candidates:
+        point = get_point(collection, point_id)
+        if point is None:
+            continue
+        payload = point.get("payload") or {}
+        return {
+            "collection": collection,
+            "id": point.get("id", point_id),
+            "payload": payload,
+            "action": action,
+            "status": payload.get("compliance_status", default_status),
+            "stored": stored,
+        }
+    return None
