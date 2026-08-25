@@ -1,6 +1,6 @@
 # JoyTag MRD、PRD、BRD（代码对齐修订版）
 
-> 文档版本：2026-08-24
+> 文档版本：2026-08-25
 >
 > 实现基线：当前 JoyTag 仓库 `main` 分支代码
 >
@@ -69,7 +69,7 @@ JoyTag 的产品思路是先形成带来源和审核状态的结构化标签库�
 ```text
 商品标题 + 类目
   → 本地向量化
-  → 按国家和“可复用”状态召回 top-16
+  → 按国家和“可复用”状态召回 top-32
   → 可选类目过滤
   → 默认按向量相似度排序，不调用 LLM
   → 服务端可选：标题假名化后将最多 top-8 候选交给 LLM 精排
@@ -298,7 +298,7 @@ flowchart LR
 
 1. 接收商品标题、目标国家、可选类目和 `top_k`；
 2. 使用同一套本地 Embedding 模型生成查询向量；
-3. 在 Qdrant 中按国家和 `compliance_status=可复用` 过滤，召回最多 16 个候选；
+3. 在 Qdrant 中按国家和 `compliance_status=可复用` 过滤，召回最多 32 个候选；低于最低相似度门槛的候选不参与后续排序；
 4. 应用层执行类目过滤；
 5. 默认模式对过滤后的全部候选按相似度降序、去重并截取 `top_k`，不查询趋势热词、不做假名化、不调用 provider；
 6. 服务端可配置 `RECOMMEND_RERANK_MODE=llm`，将最多 8 个候选交给 LLM 精排；
@@ -372,7 +372,7 @@ OpenAPI `/docs` 和受版本控制的 `backend/models/schemas.py` 是请求和�
   "total_candidates": 16,
   "filtered_candidates": 8,
   "ai_assisted": false,
-  "parameters_version": "2026-08-24",
+  "parameters_version": "2026-08-25",
   "disclosure_url": "/v1/disclosure/parameters"
 }
 ```
@@ -406,7 +406,7 @@ OpenAPI `/docs` 和受版本控制的 `backend/models/schemas.py` 是请求和�
 - **可维护性**：API 契约集中在受版本控制的 `backend/models/schemas.py`；CI 执行 `import app` 和契约测试；
 - **成本边界**：业务 LLM 请求仅对超时、连接错误、HTTP 408/429/5xx 重试一次，三类调用均设置输出 token 上限；普通与 deep 健康检查不请求外部模型；
 - **规则一致性**：安全词和禁用词比较统一使用 NFKC、空白归一化与 casefold，同时保留标点、连字符和重音，原始词不被改写；
-- **性能边界**：推荐链路采用 top-16 向量召回和类目过滤；默认直接对全部过滤候选按向量排序，可选模式才对最多 top-8 做 LLM 精排，最终默认返回最多 5 个结果；
+- **性能边界**：推荐链路采用 top-32 向量召回和类目过滤；相似度低于默认 0.75 的候选不参与排序；默认直接对通过门槛的候选按向量排序，可选模式才对最多 top-8 做 LLM 精排，最终默认返回最多 5 个结果；没有候选达到门槛时返回空结果；
 - **数据恢复**：生产必须备份 Qdrant 与 Postgres；模型缓存可重建，业务词库、规则文件和审计证据不可仅靠源码恢复。
 
 ## 3.9 当前不在范围内
@@ -592,7 +592,7 @@ OpenAPI `/docs` 和受版本控制的 `backend/models/schemas.py` 是请求和�
 | --- | --- |
 | API/Pydantic 契约与国家范围 | `backend/models/schemas.py` |
 | 推荐路由与管理 API | `backend/app.py` |
-| top-16 / 默认向量排序 / 可选 top-8 LLM / 默认 top-5 | `backend/services/recommend.py` |
+| top-32 / 最低相似度 0.75 / 默认向量排序 / 可选 top-8 LLM / 默认 top-5 | `backend/services/recommend.py` |
 | 四个 Qdrant 集合与 768 维向量 | `backend/services/qdrant_store.py` |
 | 淘宝中文采集 | `backend/services/collectors/cn_ecommerce.py`、`cn_longtail.py` |
 | Amazon/eBay 海外采集 | `amazon_suggest.py`、`ebay_suggest.py`、`overseas_trends.py` |

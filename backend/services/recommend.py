@@ -2,6 +2,7 @@ from typing import List, Dict, Any, Optional
 import asyncio
 import json
 import logging
+import math
 import os
 import httpx
 from services.embedding import get_embedding
@@ -15,10 +16,11 @@ from qdrant_client.models import Filter, FieldCondition, MatchValue
 logger = logging.getLogger(__name__)
 
 # 推荐调参常量（唯一权威源）：transparency 正文与 app.py 披露共用，改此处即可三处同步
-TOP_K_RECALL = 16   # 向量召回候选数（top-16）
+TOP_K_RECALL = 32   # 向量召回候选数（top-32）
 RERANK_DEPTH = 8    # LLM 精排输入深度（top-8）
 MAX_OUTPUT_DEFAULT = 5  # 精排输出默认上限（实际以请求 top_k 为准）
 RERANK_MAX_TOKENS = 512
+RECOMMEND_MIN_SIMILARITY_DEFAULT = 0.75
 RECOMMEND_RERANK_MODES = {"vector", "llm"}
 
 
@@ -32,6 +34,32 @@ def get_recommend_rerank_mode() -> str:
         )
         return "vector"
     return mode
+
+
+def get_recommend_min_similarity() -> float:
+    """返回推荐最低相似度；非法配置安全回退到保守默认值。"""
+    raw_value = os.getenv(
+        "RECOMMEND_MIN_SIMILARITY",
+        str(RECOMMEND_MIN_SIMILARITY_DEFAULT),
+    ).strip()
+    try:
+        value = float(raw_value)
+    except (TypeError, ValueError):
+        logger.warning(
+            "[recommend] 非法 RECOMMEND_MIN_SIMILARITY=%r，已回退 %.2f",
+            raw_value,
+            RECOMMEND_MIN_SIMILARITY_DEFAULT,
+        )
+        return RECOMMEND_MIN_SIMILARITY_DEFAULT
+
+    if not math.isfinite(value) or not 0.0 <= value <= 1.0:
+        logger.warning(
+            "[recommend] RECOMMEND_MIN_SIMILARITY 超出范围=%r，已回退 %.2f",
+            raw_value,
+            RECOMMEND_MIN_SIMILARITY_DEFAULT,
+        )
+        return RECOMMEND_MIN_SIMILARITY_DEFAULT
+    return value
 
 RERANK_SYSTEM_PROMPT = """你是一个欧洲电商本土化运营专家。你的任务是根据商品信息，从候选标签列表中选出最合适的标签，并按推荐优先级排序，同时为每个标签生成简短的推荐理由（面向内部运营人员，语言为中文）。
 
@@ -81,6 +109,22 @@ def rank_tags_by_vector(
         if len(ranked) >= max_output:
             break
     return ranked
+
+
+def filter_candidates_by_similarity(
+    candidates: List[Dict[str, Any]],
+    min_similarity: float,
+) -> List[Dict[str, Any]]:
+    """保留达到最低相似度且分数有效的候选，不改变原始顺序。"""
+    filtered: List[Dict[str, Any]] = []
+    for candidate in candidates:
+        score = candidate.get("similarity")
+        if isinstance(score, bool) or not isinstance(score, (int, float)):
+            continue
+        if not math.isfinite(score) or score < min_similarity:
+            continue
+        filtered.append(candidate)
+    return filtered
 
 
 def validate_rerank_recommendations(

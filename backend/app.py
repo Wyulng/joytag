@@ -4,6 +4,7 @@ import uuid
 import json
 import asyncio
 import logging
+import math
 from functools import wraps
 from contextlib import asynccontextmanager
 
@@ -52,7 +53,8 @@ from services.rule_manager import (
 )
 from services.recommend import (
     retrieve_candidate_tags, rerank_tags_with_llm, rank_tags_by_vector,
-    filter_candidates_by_category, get_recommend_rerank_mode,
+    filter_candidates_by_category, filter_candidates_by_similarity,
+    get_recommend_rerank_mode, get_recommend_min_similarity,
     TOP_K_RECALL, RERANK_DEPTH,
 )
 from services.task_scheduler import (
@@ -343,7 +345,7 @@ async def disclosure_parameters():
     rerank_mode = get_recommend_rerank_mode()
     return DisclosureParameters(
         version=DISCLOSURE_VERSION,
-        last_updated="2026-08-24",
+        last_updated=DISCLOSURE_VERSION,
         system_name="joytag",
         description="Joytag 为 Joybuy 欧洲站商品标题生成本地化长尾标签推荐，供站内搜索召回使用（平台功能支持型推荐系统）。",
         input_signals=[
@@ -372,6 +374,8 @@ async def disclosure_parameters():
                     "model": "Alibaba-NLP/gte-multilingual-base",
                     "dim": 768,
                     "top_n": TOP_K_RECALL,
+                    "minimum_similarity": get_recommend_min_similarity(),
+                    "abstain_below_minimum": True,
                     "default_ranking_mode": "vector",
                     "configured_ranking_mode": rerank_mode,
                 },
@@ -509,12 +513,33 @@ async def recommend_tags(request: Request, req: RecommendRequest,
     )
     total_candidates = len(candidates)
 
-    # 3. 应用层类目过滤（可选，当前不强制）
-    filtered = filter_candidates_by_category(candidates, req.category)
+    # 3. 应用层类目过滤和最低相似度门控（可选类目 + 必须达到质量阈值）
+    category_filtered = filter_candidates_by_category(candidates, req.category)
+    min_similarity = get_recommend_min_similarity()
+    filtered = filter_candidates_by_similarity(category_filtered, min_similarity)
     filtered_count = len(filtered)
 
     if not filtered:
-        logger.info(f"[api] 标签推荐无候选结果: total={total_candidates}")
+        valid_scores = [
+            candidate["similarity"]
+            for candidate in category_filtered
+            if (
+                not isinstance(candidate.get("similarity"), bool)
+                and isinstance(candidate.get("similarity"), (int, float))
+                and math.isfinite(candidate["similarity"])
+            )
+        ]
+        top_similarity = max(valid_scores, default=None)
+        logger.info(
+            "[recommendation_abstain] country=%s mode=%s candidate_count=%d "
+            "eligible_count=%d top_similarity=%s threshold=%.4f",
+            req.target_country,
+            rerank_mode,
+            len(candidates),
+            filtered_count,
+            f"{top_similarity:.4f}" if top_similarity is not None else "none",
+            min_similarity,
+        )
         return build_recommend_response([], total_candidates, filtered_count)
 
     # 4. 默认纯向量排序；只有服务端显式启用 llm 模式才产生外部调用。
