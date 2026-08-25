@@ -96,7 +96,7 @@ flowchart LR
     -> GTE 批量向量化后写入 cn_anchors
 ~~~
 
-中文采集使用 `CN_SOURCE_MODE=taobao_suggest`。淘宝公开 suggest 接口当前不提供可直接依赖的全局热榜、分页或时间范围参数，因此系统把响应第二字段解释为“当前响应内部的相对热度”，不把它当作真实搜索量、销量或成交量。来源响应、候选观察和动态种子 frontier 在 Postgres 可用时持久化，并分别使用 24 小时起步的来源退避、动态种子 7 天冷却和固定种子每日轮换；本地无 Postgres 时退回进程内状态，不影响开发采集。
+中文采集使用 `CN_SOURCE_MODE=taobao_suggest`。淘宝公开 suggest 接口当前不提供可直接依赖的全局热榜、分页或时间范围参数，因此系统把响应第二字段解释为“当前响应内部的相对热度”，不把它当作真实搜索量、销量或成交量。Postgres 可用时，来源响应快照、候选观察和动态种子 frontier 会持久化：淘宝来源按 `24/72/168` 小时递进刷新，Amazon 按 `6/24/72/168` 小时递进刷新，eBay 按 `24/72/168` 小时递进刷新；来源错误使用 `1/2/4/6` 小时重试。动态种子冷却为 7 天，固定种子每日轮换，已处理中文候选 30 天后才允许复检。没有 Postgres 时，来源快照和候选观察不会伪造持久缓存，动态种子 frontier 使用进程内 fallback，不影响本地开发采集。
 
 #### 推荐请求
 
@@ -238,6 +238,33 @@ curl -X POST http://localhost:8001/v1/tag/recommend \
 
 主要管理资源包括只读的 `/admin/api/collection/status`、`/admin/api/pending/*`、`/admin/api/tags/*`、`/admin/api/anchors/*`、`/admin/api/rules/*`、`/admin/api/blocked`、`/admin/api/audit`、`/admin/api/dsar` 和 `/admin/api/retention/*`。中文与海外采集由系统固定任务自动执行，不再提供人工采集或动态 Cron API；完整请求模型可通过 `/docs` 查看。
 
+`GET /admin/api/collection/status` 返回固定任务的时区、Cron 表达式、下一次运行时间、运行中标记和最近状态。最近一次任务详情只保留聚合计数，不返回原始词条、`run_id` 或其他采集内容，示例：
+
+~~~json
+{
+  "timezone": "Asia/Shanghai",
+  "manual_collection_enabled": false,
+  "jobs": [
+    {
+      "id": "auto_cn_collection",
+      "task_type": "cn",
+      "cron": "0 2 * * *",
+      "next_run_at": "2026-08-26T02:00:00+08:00",
+      "running": false,
+      "last_status": "success"
+    },
+    {
+      "id": "auto_overseas_collection",
+      "task_type": "overseas",
+      "cron": "0 4,16 * * *",
+      "next_run_at": "2026-08-26T04:00:00+08:00",
+      "running": false,
+      "last_status": "never"
+    }
+  ]
+}
+~~~
+
 ## 配置
 
 从 `.env.example` 复制配置后，根据运行模式填写变量。不要把 `.env`、真实 API Key 或生产数据库密码提交到仓库。
@@ -272,7 +299,7 @@ Compose 还要求填写 `POSTGRES_PASSWORD`、`JOYTAG_DB_PASSWORD`、`KEYCLOAK_D
 3. 将 GTE 模型权重单独准备到 `backend/models/gte-multilingual-base/`，或通过 `EMBEDDING_MODEL_PATH` 指定已挂载的模型目录；模型权重不随 Git 发布。
 4. 启动服务：`docker compose up -d --build`。
 5. 为 `8001` 和 `8080` 设置安全组白名单；不要把 Qdrant `6333/6334` 或 Postgres `5432` 暴露到公网。
-6. 通过 Keycloak 在 `joytag` Realm 创建首个应用用户并分配 `admin` 角色；首次登录按要求绑定 TOTP。`joytag-admin` 客户端必须保留 `joytag-admin-realm-roles` mapper，将 realm roles 写入 ID Token 的 `realm_access.roles`，Backend 据此建立管理会话。生产回调地址为 `http://43.128.130.240:8001/*`，本地开发回调地址保留为 `http://localhost:8000/*` 和 `http://localhost:8001/*`。
+6. 通过 Keycloak 在 `joytag` Realm 创建首个应用用户并分配 `admin` 角色；首次登录按要求绑定 TOTP。`joytag-admin` 客户端必须保留 `joytag-admin-realm-roles` mapper，将 realm roles 写入 ID Token 的 `realm_access.roles`，Backend 据此建立管理会话。生产 redirect URI 应按实际部署域名或地址配置为 `http://<deployment-host>:8001/*`（接入 TLS 后改为 HTTPS）；本地开发回调地址保留为 `http://localhost:8000/*` 和 `http://localhost:8001/*`。不要直接复用仓库中的示例地址。
 7. 调度器启动时幂等注册固定任务：中文每日 `02:00`，海外每日 `04:00` 与 `16:00`，时区均为 `Asia/Shanghai`；合规留存清理保持每日 `03:00 UTC`。任务不会在启动时立即执行，采集重叠时跳过当前轮并记录日志、审计和 lineage；`schedules.json` 不再作为运行配置。
 8. 对已有的非空 Realm，不要重复执行 `--import-realm` 覆盖配置。发布后使用 master 管理员通过 Keycloak 管理 API 或 `kcadm` 幂等补齐 `joytag-admin` mapper 和生产 redirect URI：先备份客户端 JSON，按稳定 mapper 名称查询，缺失则创建、配置不一致则更新，确认只存在一个同名 mapper 后再进行 PKCE 登录验证。创建测试 operator 时补齐 Keycloak 26 用户资料字段并清空 required actions；测试完成后删除临时用户。若现有管理员密码丢失，先在隔离数据库副本验证 Keycloak 26.7.2 的 `bootstrap-admin` 恢复流程，再按维护窗口执行升级；Keycloak 数据库迁移后不能只降级镜像回滚，必须同时恢复升级前数据库备份。
 9. 配置域名和 TLS 反向代理后，将 `TLS_ENABLED=true`，再开放管理端访问。
@@ -356,6 +383,7 @@ backend/
     schemas.py                   # 受版本控制的 API 契约与合规常量（启动必需）
   services/
     collectors/                  # 中文、Amazon、eBay 采集和种子构建
+    collector_state.py           # 来源快照、候选观察和中文种子 frontier
     alignment.py                 # 多语言锚点对齐、合规评估和入库
     recommend.py                 # 向量召回、默认向量排序与可选 LLM 精排
     qdrant_store.py              # Qdrant 集合与幂等 CRUD
@@ -364,6 +392,7 @@ backend/
     audit.py / llm_trace.py      # 审计与 LLM 留痕
     lineage.py / dsar.py         # 血缘与数据主体请求
     auth.py / retention.py       # 认证和留存策略
+    task_scheduler.py            # 固定自动采集与留存任务
   static/                        # 内嵌管理单页
   tests/                         # unittest 接口契约与回退行为测试
 docs/EU_COMPLIANCE_PLAN.md       # EU 合规改造计划
@@ -383,3 +412,4 @@ docker-compose.yml               # Qdrant、Postgres、Keycloak、Backend
 ## 许可证
 
 Joytag 使用 [MIT License](LICENSE) 发布。
+
