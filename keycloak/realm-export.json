@@ -33,7 +33,7 @@
     "realm": [
       { "name": "admin", "description": "全部管理权限（含审计/规则/词库删除）" },
       { "name": "reviewer", "description": "待审核词条通过/拒绝 + 只读词库/规则" },
-      { "name": "operator", "description": "采集触发/调度任务 CRUD/统计" }
+      { "name": "operator", "description": "历史兼容角色；当前无人工采集或调度接口权限" }
     ]
   },
   "clients": [

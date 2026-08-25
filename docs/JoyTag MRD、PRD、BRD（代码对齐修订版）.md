@@ -84,7 +84,7 @@ JoyTag 的产品思路是先形成带来源和审核状态的结构化标签库�
 | --- | --- | --- |
 | 管理员 `admin` | [已实现] | 管理规则、标签、锚点、拦截记录、审计、DSAR 与留存策略 |
 | 审核员 `reviewer` | [已实现] | 审核存疑词，记录通过或拒绝理由 |
-| 采集运营 `operator` | [已实现] | 触发采集、维护定时任务、查看运行统计 |
+| 采集运营 `operator` | [兼容保留] | 历史角色；当前不提供人工采集或调度接口权限 |
 | 服务调用方 | [已实现] | 通过 Bearer token 和 `joytag:recommend` scope 调用推荐 API |
 | 商品运营工作台 | [待实现] | 在商品上架流程中展示、采纳或拒绝 Tag |
 | 消费者搜索系统 | [待实现] | 消费商品关联 Tag 并参与召回或排序 |
@@ -256,7 +256,7 @@ flowchart LR
 
 | 层 | 当前选型 | 当前实现说明 |
 | --- | --- | --- |
-| Backend | Python 3.11 + FastAPI + Uvicorn | 异步 API、采集触发、管理路由和生命周期管理 |
+| Backend | Python 3.11 + FastAPI + Uvicorn | 异步 API、固定自动采集调度、管理路由和生命周期管理 |
 | 管理 UI | 静态 HTML + 原生 JavaScript | 内嵌单页，无 React、无前端构建链、无独立前端服务 |
 | 中文数据源 | 淘宝搜索建议 | 用于中文锚点采集；当前不描述为六国语言合规评估流程 |
 | 海外数据源 | Amazon completion + eBay autosuggest | Amazon 为主源，eBay 为辅助源 |
@@ -265,7 +265,7 @@ flowchart LR
 | 向量库 | Qdrant 1.9.0 | 四个集合、余弦距离、确定性 ID、payload 保存 provenance |
 | 合规数据库 | PostgreSQL 16 | audit、llm_trace、lineage、DSAR 和 retention 数据 |
 | 身份与权限 | Keycloak 26.7.2 | OIDC、RBAC、TOTP、服务间 scope 和会话 CSRF；管理客户端 ID Token 通过 realm-role mapper 携带 `realm_access.roles` |
-| 调度 | APScheduler 3.x | 采集任务、手动运行和每日留存清理 |
+| 调度 | APScheduler 3.x | 固定自动采集和每日留存清理；不读取动态 Cron 配置 |
 
 ### 3.3.3 数据采集与语义处理流程
 
@@ -337,9 +337,7 @@ flowchart LR
 | `GET /v1/disclosure/parameters` | 公开 | 推荐参数披露 |
 | `GET /v1/transparency` | 公开 | 透明度 JSON |
 | `POST /v1/dsar/request` | 公开、5/hour | DSAR 受理 |
-| `POST /admin/api/collect/overseas` | operator | 海外采集 |
-| `POST /admin/api/collect/cn` | operator | 中文锚点采集 |
-| `/admin/api/schedules/*` | operator | 调度管理 |
+| `GET /admin/api/collection/status` | 会话 | 固定自动采集状态（只读） |
 | `/admin/api/pending/*` | reviewer | 待审核处理 |
 | `/admin/api/tags/*` | 会话；删除 admin | 标签管理 |
 | `/admin/api/anchors/*` | 会话；删除 admin | 锚点管理 |
@@ -387,8 +385,8 @@ OpenAPI `/docs` 和受版本控制的 `backend/models/schemas.py` 是请求和�
 
 1. 启动 Qdrant、PostgreSQL、Keycloak 和 Backend，访问 `/health` 与 `/health?deep=1`，确认均不产生模型请求；受控运维可用共享密钥执行一次 `llm_probe=1`；
 2. 登录 `/admin`，确认角色权限和九个管理页签；
-3. 调用 `POST /admin/api/collect/cn`，观察淘宝建议词写入 `cn_anchors` 及 lineage；
-4. 调用 `POST /admin/api/collect/overseas`，观察 Amazon/eBay 来源、翻译、规则分流以及 `local_tags`、`pending_review`、`blocked_decisions` 的变化；
+3. 在采集页查看 `GET /admin/api/collection/status`，确认中文每日 `02:00`、海外每日 `04:00` 与 `16:00`（`Asia/Shanghai`），人工采集已关闭；
+4. 等待或在隔离环境触发固定任务，观察淘宝/Amazon/eBay 来源、翻译、规则分流以及 `cn_anchors`、`local_tags`、`pending_review`、`blocked_decisions` 的变化；
 5. 在待审核页通过或拒绝一条词，验证规则库、Qdrant 记录和审计链同步更新；
 6. 在默认向量模式调用 `POST /v1/tag/recommend`，核对候选集约束、provenance、相似度、固定理由以及 `ai_assisted=false`；
 7. 模拟 LLM 不可用，验证默认推荐仍正常返回；再临时启用可选 LLM 模式，验证失败时回退向量排序且 `ai_assisted=false`；

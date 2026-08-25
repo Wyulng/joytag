@@ -35,7 +35,7 @@ Joytag 当前是后端推荐 API 与管理后台，不是面向消费者的搜�
 - **可切换模型供应商**：通过 provider 适配层支持 OpenAI-compatible、Azure OpenAI 和 Amazon Bedrock，切换以配置为主。
 - **隐私最小化**：默认推荐不向外部 LLM 发送商品标题；启用 LLM 精排时先对邮箱、电话、IP、IBAN 和信用卡等信息做假名化，日志不保存完整标题。
 - **可审计与可追溯**：管理操作使用 hash-chain 审计；LLM 调用保存 prompt 哈希、PII token 映射和词条哈希；采集任务保存 lineage 事件。
-- **统一管理后台**：内嵌原生 HTML/JS 单页，提供待审核、标签库、锚点库、规则、拦截决策、审计、DSAR 和调度管理。
+- **统一管理后台**：内嵌原生 HTML/JS 单页，提供待审核、标签库、锚点库、规则、拦截决策、审计、DSAR 和自动采集状态查看。
 
 ## 系统架构
 
@@ -68,7 +68,7 @@ flowchart LR
 | LLM | 动态种子翻译、必要的合规评估和可选推荐精排 | provider 适配层 |
 | Postgres | 审计、LLM trace、lineage、DSAR 和留存策略 | PostgreSQL 16 |
 | Keycloak | OIDC SSO、RBAC 和 TOTP | 26.7.2 |
-| Scheduler | 定时采集和每日留存清理 | APScheduler 3.x |
+| Scheduler | 固定自动采集和每日留存清理 | APScheduler 3.x；Asia/Shanghai 固定时区 |
 
 ### 数据流
 
@@ -234,9 +234,9 @@ curl -X POST http://localhost:8001/v1/tag/recommend \
 | --- | --- |
 | `admin` | 全部管理能力，包括规则、删除、审计、DSAR 和留存策略 |
 | `reviewer` | 待审核词条通过 / 拒绝，以及只读能力 |
-| `operator` | 采集触发、定时任务和运行统计 |
+| `operator` | 历史兼容角色；当前不再拥有人工采集或调度接口权限 |
 
-主要管理资源包括 `/admin/api/collect/*`、`/admin/api/pending/*`、`/admin/api/tags/*`、`/admin/api/anchors/*`、`/admin/api/rules/*`、`/admin/api/blocked`、`/admin/api/audit`、`/admin/api/dsar` 和 `/admin/api/retention/*`。完整请求模型可通过 `/docs` 查看。
+主要管理资源包括只读的 `/admin/api/collection/status`、`/admin/api/pending/*`、`/admin/api/tags/*`、`/admin/api/anchors/*`、`/admin/api/rules/*`、`/admin/api/blocked`、`/admin/api/audit`、`/admin/api/dsar` 和 `/admin/api/retention/*`。中文与海外采集由系统固定任务自动执行，不再提供人工采集或动态 Cron API；完整请求模型可通过 `/docs` 查看。
 
 ## 配置
 
@@ -273,9 +273,9 @@ Compose 还要求填写 `POSTGRES_PASSWORD`、`JOYTAG_DB_PASSWORD`、`KEYCLOAK_D
 4. 启动服务：`docker compose up -d --build`。
 5. 为 `8001` 和 `8080` 设置安全组白名单；不要把 Qdrant `6333/6334` 或 Postgres `5432` 暴露到公网。
 6. 通过 Keycloak 在 `joytag` Realm 创建首个应用用户并分配 `admin` 角色；首次登录按要求绑定 TOTP。`joytag-admin` 客户端必须保留 `joytag-admin-realm-roles` mapper，将 realm roles 写入 ID Token 的 `realm_access.roles`，Backend 据此建立管理会话。生产回调地址为 `http://43.128.130.240:8001/*`，本地开发回调地址保留为 `http://localhost:8000/*` 和 `http://localhost:8001/*`。
-7. 推荐将中文采集配置为每日一次、海外采集配置为每 6 小时一次；动态中文种子在下一轮中文任务生效。调度器不会在升级代码时自动创建生产任务，需由管理员在管理 API 中显式保存 cron 配置。
-7. 对已有的非空 Realm，不要重复执行 `--import-realm` 覆盖配置。发布后使用 master 管理员通过 Keycloak 管理 API 或 `kcadm` 幂等补齐 `joytag-admin` mapper 和生产 redirect URI：先备份客户端 JSON，按稳定 mapper 名称查询，缺失则创建、配置不一致则更新，确认只存在一个同名 mapper 后再进行 PKCE 登录验证。创建测试 operator 时补齐 Keycloak 26 用户资料字段并清空 required actions；测试完成后删除临时用户。若现有管理员密码丢失，先在隔离数据库副本验证 Keycloak 26.7.2 的 `bootstrap-admin` 恢复流程，再按维护窗口执行升级；Keycloak 数据库迁移后不能只降级镜像回滚，必须同时恢复升级前数据库备份。
-8. 配置域名和 TLS 反向代理后，将 `TLS_ENABLED=true`，再开放管理端访问。
+7. 调度器启动时幂等注册固定任务：中文每日 `02:00`，海外每日 `04:00` 与 `16:00`，时区均为 `Asia/Shanghai`；合规留存清理保持每日 `03:00 UTC`。任务不会在启动时立即执行，采集重叠时跳过当前轮并记录日志、审计和 lineage；`schedules.json` 不再作为运行配置。
+8. 对已有的非空 Realm，不要重复执行 `--import-realm` 覆盖配置。发布后使用 master 管理员通过 Keycloak 管理 API 或 `kcadm` 幂等补齐 `joytag-admin` mapper 和生产 redirect URI：先备份客户端 JSON，按稳定 mapper 名称查询，缺失则创建、配置不一致则更新，确认只存在一个同名 mapper 后再进行 PKCE 登录验证。创建测试 operator 时补齐 Keycloak 26 用户资料字段并清空 required actions；测试完成后删除临时用户。若现有管理员密码丢失，先在隔离数据库副本验证 Keycloak 26.7.2 的 `bootstrap-admin` 恢复流程，再按维护窗口执行升级；Keycloak 数据库迁移后不能只降级镜像回滚，必须同时恢复升级前数据库备份。
+9. 配置域名和 TLS 反向代理后，将 `TLS_ENABLED=true`，再开放管理端访问。
 
 应用管理员密码属于运行时机密，不提交 Git，也不通过聊天传递。服务器恢复或轮换时，将其保存到权限为 `600` 的 `deploy-backups/<timestamp>/app-admin.credentials`；Keycloak master 管理员密码仍只保存在服务器 `.env`，两者不可混用。具体服务器绝对路径仅保存在本地忽略的 `AGENTS.md` 运维记忆中。
 

@@ -126,9 +126,9 @@ Keycloak :8080（对外但安全组限办公 IP；realm 导入；MFA TOTP 强制
 | `lineage.py` | OpenLineage 形状血缘事件（JSONB 自存）：`record_event(run_id, job_name, event_type, inputs, outputs, facets)` |
 | `auth.py` | authlib 验 JWT（JWKS 缓存 + 未知 kid 重取）+ `require_role`/`require_scope` 依赖；itsdangerous 会话 cookie（HttpOnly/SameSite=Lax/TLS 时 Secure）+ CSRF 双提交 + PKCE |
 | `dsar.py` | `create_request`/`search_subject_data`/`execute_erasure`/`record_objection` |
-| `retention.py` | 留存策略表读写 + `run_all_purges()`；APScheduler 系统任务每日 03:00 UTC |
+| `retention.py` | 留存策略表读写 + `run_all_purges()`；APScheduler 固定系统任务每日 03:00 UTC |
 
-**角色映射**（Keycloak realm roles）：`admin` = 全部；`reviewer` = pending 审核 + 只读 tags/rules；`operator` = 采集/调度 + stats；服务账号 scope `joytag:recommend` = recommend API。
+**角色映射**（Keycloak realm roles）：`admin` = 全部；`reviewer` = pending 审核 + 只读 tags/rules；`operator` = 历史兼容角色，不再拥有人工采集或调度接口权限；服务账号 scope `joytag:recommend` = recommend API。
 
 ### 7.2 Postgres schema（joytag 库，幂等 DDL）
 
@@ -160,7 +160,7 @@ Keycloak :8080（对外但安全组限办公 IP；realm 导入；MFA TOTP 强制
 
 **backend/services/logging_config.py**：JSONFormatter 加脱敏 patterns；导出 `sanitize_for_log()`。
 
-**backend/services/task_scheduler.py**：注册系统任务 `compliance_retention`（每日 03:00 UTC）。
+**backend/services/task_scheduler.py**：使用 `Asia/Shanghai` 显式时区固定注册中文采集（每日 02:00）和海外采集（每日 04:00、16:00），并注册 `compliance_retention`（每日 03:00 UTC）；任务幂等、单实例、合并错过触发，采集重叠时跳过并记录。已删除动态 Cron、`schedules.json` 和人工采集接口；`/admin/api/collection/status` 只读返回下一次运行时间和最近状态。
 
 **backend/web_ui.py + static/**：新页面 transparency/audit/dsar；页面路由加 `require_admin_session` 未登录 302；admin.js 加 credentials/CSRF 头/401 跳登录；pending.html 拒绝必填理由。
 
