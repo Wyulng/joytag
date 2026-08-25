@@ -91,7 +91,7 @@ flowchart LR
 商品标题 + 类目 + 目标国家
     -> 本地 Embedding
     -> Qdrant 过滤 country 与 compliance_status
-    -> 召回 top-16，默认按向量相似度排序
+    -> 召回 top-32，低于最低相似度门槛时不返回推荐
     -> 可选：服务端启用 LLM 精排时，标题先假名化并精排最多 top-8
     -> 返回默认最多 5 个带解释和 provenance 的 Tag
 ~~~
@@ -192,15 +192,15 @@ curl -X POST http://localhost:8001/v1/tag/recommend \
       "ai_generated": false
     }
   ],
-  "total_candidates": 16,
+  "total_candidates": 32,
   "filtered_candidates": 8,
   "ai_assisted": false,
-  "parameters_version": "2026-08-24",
+  "parameters_version": "2026-08-25",
   "disclosure_url": "/v1/disclosure/parameters"
 }
 ~~~
 
-默认 `RECOMMEND_RERANK_MODE=vector`，推荐按多语言向量相似度确定性排序，不调用 LLM，返回项的 `ai_generated` 和响应的 `ai_assisted` 均为 `false`。服务端可改为 `llm`：LLM 仍只能从向量召回候选中选择标签，未知词、重复词或格式错误的输出会被丢弃；模型不可用时继续回退向量排序。
+默认 `RECOMMEND_RERANK_MODE=vector`，推荐按多语言向量相似度确定性排序，不调用 LLM，返回项的 `ai_generated` 和响应的 `ai_assisted` 均为 `false`。默认最低相似度为 `0.75`，没有候选达到门槛时返回 `recommendations=[]`，不为了凑满 `top_k` 返回低置信度词条。服务端可改为 `llm`：LLM 仍只能从通过相似度门槛的向量召回候选中选择标签，未知词、重复词或格式错误的输出会被丢弃；模型不可用时继续回退向量排序。
 
 所有业务 LLM 调用最多进行 2 次 provider 尝试（首次请求 + 1 次瞬时故障重试）；只有超时、网络连接错误、HTTP 408/429/5xx 会重试，等待 1 秒。合规评估、动态种子翻译和可选精排的输出上限分别为 256、512、512 tokens。规则比较使用 Unicode NFKC、首尾去空白、连续空白合并和 `casefold`，但保留标点、连字符与重音，原词仍原样展示和入库。
 
@@ -234,6 +234,7 @@ curl -X POST http://localhost:8001/v1/tag/recommend \
 | `LLM_PROVIDER` | LLM 适配器 | `openai_compat`、`azure` 或 `bedrock` |
 | `LLM_BASE_URL` / `LLM_API_KEY` / `LLM_MODEL` | LLM 服务 | 默认配置面向 DeepSeek 兼容接口 |
 | `RECOMMEND_RERANK_MODE` | 推荐排序模式 | 默认 `vector`（零 LLM）；可设为 `llm` 启用可选精排 |
+| `RECOMMEND_MIN_SIMILARITY` | 推荐最低相似度 | 默认 `0.75`；低于门槛时安全返回空结果，设为 `0` 可临时关闭门槛 |
 | `QDRANT_URL` / `QDRANT_API_KEY` | 向量数据库 | Compose 会将 URL 覆盖为 `http://qdrant:6333` |
 | `EMBEDDING_MODEL` / `EMBEDDING_MODEL_PATH` | 多语言 Embedding 模型及本地路径 | 默认 GTE；本地目录存在且包含权重时优先使用 |
 | `EMBEDDING_MODEL_REVISION` | 远程模型固定版本 | 默认 `9bbca17d9273fd0d03d5725c7a4b0f6b45142062` |

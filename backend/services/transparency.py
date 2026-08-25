@@ -25,6 +25,7 @@ from services.recommend import (
     TOP_K_RECALL,
     RERANK_DEPTH,
     get_recommend_rerank_mode,
+    get_recommend_min_similarity,
 )
 from services.qdrant_store import (
     ANCHOR_MATCH_THRESHOLD,
@@ -32,7 +33,7 @@ from services.qdrant_store import (
 )
 from services.collectors.countries import EU_COUNTRIES
 
-LAST_UPDATED = "2026-08-24"
+LAST_UPDATED = "2026-08-25"
 SYSTEM_NAME = "joytag"
 DISCLOSURE_URL = "/v1/disclosure/parameters"
 
@@ -83,6 +84,7 @@ SECTIONS = [
         "paragraphs": [
             "推荐结果由以下参数共同决定（按重要性排序）：",
             f"  向量相似度：标题向量与标签向量余弦相似度召回 top-{TOP_K_RECALL}，默认按该分数返回 top-k（本地 GTE 多语言模型，768 维）；",
+            f"  最低置信度：相似度低于 {get_recommend_min_similarity():.2f} 的候选不参与排序，若没有候选达到门槛则返回空结果；",
             f"  锚点对齐：海外词先按类目筛选中文锚点，再在同一多语言向量空间匹配；默认阈值为 {ANCHOR_MATCH_THRESHOLD:.2f}，无类目时为 {ANCHOR_MATCH_UNCATEGORIZED_THRESHOLD:.2f}；",
             f"  可选 LLM 精排：仅当服务端配置为 llm 时，综合语义匹配、文化合规、趋势热度和去重，从 top-{RERANK_DEPTH} 选出最终结果并生成推荐理由；",
             "  合规过滤（硬性排除）：仅推荐合规状态为「可复用」的标签；"

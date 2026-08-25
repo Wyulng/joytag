@@ -1,6 +1,6 @@
 # Joytag EU 合规改造方案（GDPR / DSA / UCPD + AI Act 附带）
 
-> 状态：**代码内合规控制已按当前仓库落地**（截至 2026-08-24）。本文件同时保留历史实施蓝图；能力是否已实现以当前代码为准，法律结论仍需独立法律审查。
+> 状态：**代码内合规控制已按当前仓库落地**（截至 2026-08-25）。本文件同时保留历史实施蓝图；能力是否已实现以当前代码为准，法律结论仍需独立法律审查。
 >
 > ## 〇、执行进度
 >
@@ -148,7 +148,7 @@ Keycloak :8080（对外但安全组限办公 IP；realm 导入；MFA TOTP 强制
 
 **backend/services/llm.py**：去硬编码 URL 走 provider；retry 包装记录耗时 + llm_trace；assess 提示词升级 UCPD Annex I 判定（引用 rule_id）；发送前假名化；三类请求设置输出上限，仅对超时、连接错误、408、429 和 5xx 重试一次。
 
-**backend/services/recommend.py**：`RECOMMEND_RERANK_MODE=vector` 默认纯向量排序，不查询趋势热词、不假名化标题、不调用 provider；可选 `llm` 模式保留 top-8 精排、标题假名化、llm_trace 和向量 fallback；候选透传 provenance，非法配置安全回退 `vector`。
+**backend/services/recommend.py**：`RECOMMEND_RERANK_MODE=vector` 默认纯向量排序，不查询趋势热词、不假名化标题、不调用 provider；当前召回最多 top-32，并以默认 0.75 最低相似度门槛安全放弃低置信度结果；可选 `llm` 模式保留 top-8 精排、标题假名化、llm_trace 和向量 fallback；候选透传 provenance，非法配置安全回退 `vector`。
 
 **backend/services/alignment.py**：加 source/collection_run_id 参数；无锚点词仅走本地规则，禁用时写 `blocked_decisions`，其余写 `pending_review` 且不调用 LLM；有锚点词继续规则优先、必要时 LLM；CN 流程加 provenance；每词 lineage 事件。
 
@@ -190,7 +190,7 @@ Keycloak :8080（对外但安全组限办公 IP；realm 导入；MFA TOTP 强制
 
 **P2 生命周期与透明页**：dsar + retention + transparency 页；域名就绪后 Caddy TLS。
 
-**LLM 降本一期**：默认向量推荐；无锚点规则门控；重试和输出上限；规则比较归一化；显式授权的真实健康探测；披露版本统一为 `2026-08-24`。
+**LLM 降本一期**：默认向量推荐；无锚点规则门控；重试和输出上限；规则比较归一化；显式授权的真实健康探测；披露版本统一为 `2026-08-25`。
 
 ## 九、验证方案
 

@@ -17,8 +17,12 @@ from services import llm, rule_manager
 from services.llm_provider import LLMProviderError, LLMResult
 from services.recommend import (
     RERANK_MAX_TOKENS,
+    TOP_K_RECALL,
+    filter_candidates_by_similarity,
     get_recommend_rerank_mode,
+    get_recommend_min_similarity,
     rank_tags_by_vector,
+    retrieve_candidate_tags,
     rerank_tags_with_llm,
 )
 
@@ -45,6 +49,39 @@ def _request() -> Request:
 
 
 class VectorRecommendationTests(unittest.IsolatedAsyncioTestCase):
+    def test_similarity_filter_is_inclusive_and_rejects_invalid_scores(self):
+        candidates = [
+            {"word": "high", "similarity": 0.80},
+            {"word": "threshold", "similarity": 0.75},
+            {"word": "low", "similarity": 0.749},
+            {"word": "missing"},
+            {"word": "string", "similarity": "0.90"},
+            {"word": "nan", "similarity": float("nan")},
+            {"word": "infinite", "similarity": float("inf")},
+            {"word": "bool", "similarity": True},
+        ]
+
+        result = filter_candidates_by_similarity(candidates, 0.75)
+
+        self.assertEqual(
+            [candidate["word"] for candidate in result],
+            ["high", "threshold"],
+        )
+
+    def test_min_similarity_config_defaults_and_invalid_values_fallback(self):
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(get_recommend_min_similarity(), 0.75)
+
+        for invalid in ("", "invalid", "-0.1", "1.1", "nan", "inf"):
+            with self.subTest(invalid=invalid), patch.dict(
+                os.environ,
+                {"RECOMMEND_MIN_SIMILARITY": invalid},
+            ), self.assertLogs("services.recommend", level="WARNING"):
+                self.assertEqual(get_recommend_min_similarity(), 0.75)
+
+        with patch.dict(os.environ, {"RECOMMEND_MIN_SIMILARITY": "0"}):
+            self.assertEqual(get_recommend_min_similarity(), 0.0)
+
     def test_vector_rank_is_deterministic_deduplicated_and_non_ai(self):
         candidates = [
             {"word": "lower", "similarity": 0.4},
@@ -106,6 +143,36 @@ class VectorRecommendationTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(response.ai_assisted)
         self.assertTrue(all(not item.ai_generated for item in response.recommendations))
 
+    async def test_default_route_abstains_without_llm_when_all_scores_are_low(self):
+        candidates = [
+            {"word": "weak one", "similarity": 0.74},
+            {"word": "weak two", "similarity": 0.70},
+        ]
+        vector_rank = MagicMock()
+        llm_rank = AsyncMock()
+        with (
+            patch(
+                "app.retrieve_candidate_tags",
+                new=AsyncMock(return_value=candidates),
+            ),
+            patch("app.get_recommend_rerank_mode", return_value="vector"),
+            patch("app.get_recommend_min_similarity", return_value=0.75),
+            patch("app.rank_tags_by_vector", new=vector_rank),
+            patch("app.rerank_tags_with_llm", new=llm_rank),
+        ):
+            response = await app_module.recommend_tags.__wrapped__(
+                _request(),
+                RecommendRequest(title="coat", target_country="DE", top_k=5),
+                _scope={"scope": "joytag:recommend"},
+            )
+
+        vector_rank.assert_not_called()
+        llm_rank.assert_not_awaited()
+        self.assertEqual(response.recommendations, [])
+        self.assertEqual(response.total_candidates, 2)
+        self.assertEqual(response.filtered_candidates, 0)
+        self.assertFalse(response.ai_assisted)
+
     async def test_llm_mode_keeps_optional_rerank_path(self):
         candidates = [{"word": "winter coat", "similarity": 0.91}]
         llm_rank = AsyncMock(return_value=[{
@@ -130,7 +197,58 @@ class VectorRecommendationTests(unittest.IsolatedAsyncioTestCase):
 
         vector_rank.assert_not_called()
         llm_rank.assert_awaited_once()
+        self.assertEqual(
+            [candidate["word"] for candidate in llm_rank.await_args.kwargs["candidates"]],
+            ["winter coat"],
+        )
         self.assertTrue(response.ai_assisted)
+
+    async def test_llm_mode_does_not_call_provider_when_all_scores_are_low(self):
+        candidates = [{"word": "weak coat", "similarity": 0.74}]
+        llm_rank = AsyncMock()
+        with (
+            patch(
+                "app.retrieve_candidate_tags",
+                new=AsyncMock(return_value=candidates),
+            ),
+            patch("app.get_recommend_rerank_mode", return_value="llm"),
+            patch("app.get_recommend_min_similarity", return_value=0.75),
+            patch("app.rerank_tags_with_llm", new=llm_rank),
+        ):
+            response = await app_module.recommend_tags.__wrapped__(
+                _request(),
+                RecommendRequest(title="coat", target_country="DE"),
+                _scope={"scope": "joytag:recommend"},
+            )
+
+        llm_rank.assert_not_awaited()
+        self.assertEqual(response.recommendations, [])
+        self.assertFalse(response.ai_assisted)
+
+    async def test_candidate_recall_limit_is_32(self):
+        client = MagicMock()
+        point = MagicMock()
+        point.id = "point-id"
+        point.score = 0.80
+        point.payload = {
+            "word": "winter coat",
+            "country": "DE",
+            "compliance_status": "可复用",
+        }
+        client.search.return_value = [point]
+
+        with (
+            patch(
+                "services.recommend.get_embedding",
+                new=AsyncMock(return_value=[0.0] * 768),
+            ),
+            patch("services.recommend.get_qdrant_client", return_value=client),
+        ):
+            candidates = await retrieve_candidate_tags("coat", "DE")
+
+        self.assertEqual(len(candidates), 1)
+        self.assertEqual(TOP_K_RECALL, 32)
+        self.assertEqual(client.search.call_args.kwargs["limit"], 32)
 
 
 class LLMRetryAndLimitTests(unittest.IsolatedAsyncioTestCase):
@@ -524,13 +642,20 @@ class RuleNormalizationTests(unittest.TestCase):
 
 class DisclosureVersionTests(unittest.IsolatedAsyncioTestCase):
     async def test_disclosure_versions_and_dates_are_synchronized(self):
-        self.assertEqual(DISCLOSURE_VERSION, "2026-08-24")
-        self.assertEqual(TRANSPARENCY_VERSION, "2026-08-24")
+        self.assertEqual(DISCLOSURE_VERSION, "2026-08-25")
+        self.assertEqual(TRANSPARENCY_VERSION, "2026-08-25")
 
         with patch("app.get_recommend_rerank_mode", return_value="vector"):
             disclosure = await app_module.disclosure_parameters()
-        self.assertEqual(disclosure.version, "2026-08-24")
-        self.assertEqual(disclosure.last_updated, "2026-08-24")
+        self.assertEqual(disclosure.version, "2026-08-25")
+        self.assertEqual(disclosure.last_updated, "2026-08-25")
+        vector_parameter = next(
+            item for item in disclosure.ranking_parameters
+            if item.key == "vector_similarity"
+        )
+        self.assertEqual(vector_parameter.values["top_n"], 32)
+        self.assertEqual(vector_parameter.values["minimum_similarity"], 0.75)
+        self.assertTrue(vector_parameter.values["abstain_below_minimum"])
 
         with patch(
             "services.transparency.get_recommend_rerank_mode",
@@ -539,8 +664,8 @@ class DisclosureVersionTests(unittest.IsolatedAsyncioTestCase):
             from services.transparency import transparency_payload
 
             payload = transparency_payload()
-        self.assertEqual(payload["version"], "2026-08-24")
-        self.assertEqual(payload["last_updated"], "2026-08-24")
+        self.assertEqual(payload["version"], "2026-08-25")
+        self.assertEqual(payload["last_updated"], "2026-08-25")
 
 
 if __name__ == "__main__":
