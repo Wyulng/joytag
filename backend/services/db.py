@@ -69,7 +69,9 @@ def execute_many(sql: str, params_seq) -> None:
     _check_available()
     with get_pool().connection() as conn:
         with conn.transaction():
-            conn.executemany(sql, params_seq)
+            # psycopg3 exposes executemany() on Cursor, not Connection.
+            with conn.cursor() as cursor:
+                cursor.executemany(sql, params_seq)
 
 
 def fetchone(sql: str, params: tuple | None = None) -> tuple | None:
