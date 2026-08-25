@@ -261,6 +261,8 @@ Compose 还要求填写 `POSTGRES_PASSWORD`、`JOYTAG_DB_PASSWORD`、`KEYCLOAK_D
 7. 对已有的非空 Realm，不要重复执行 `--import-realm` 覆盖配置。发布后使用 master 管理员通过 Keycloak 管理 API 或 `kcadm` 幂等补齐 `joytag-admin` mapper 和生产 redirect URI：先备份客户端 JSON，按稳定 mapper 名称查询，缺失则创建、配置不一致则更新，确认只存在一个同名 mapper 后再进行 PKCE 登录验证。创建测试 operator 时补齐 Keycloak 26 用户资料字段并清空 required actions；测试完成后删除临时用户。若现有管理员密码丢失，先在隔离数据库副本验证 Keycloak 26.7.2 的 `bootstrap-admin` 恢复流程，再按维护窗口执行升级；Keycloak 数据库迁移后不能只降级镜像回滚，必须同时恢复升级前数据库备份。
 8. 配置域名和 TLS 反向代理后，将 `TLS_ENABLED=true`，再开放管理端访问。
 
+应用管理员密码属于运行时机密，不提交 Git，也不通过聊天传递。服务器恢复或轮换时，将其保存到权限为 `600` 的 `deploy-backups/<timestamp>/app-admin.credentials`；Keycloak master 管理员密码仍只保存在服务器 `.env`，两者不可混用。具体服务器绝对路径仅保存在本地忽略的 `AGENTS.md` 运维记忆中。
+
 建议上线前执行：
 
 ~~~powershell
