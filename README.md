@@ -67,7 +67,7 @@ flowchart LR
 | Embedding | 中文锚点、海外词和标签的多语言向量化 | `Alibaba-NLP/gte-multilingual-base` |
 | LLM | 动态种子翻译、必要的合规评估和可选推荐精排 | provider 适配层 |
 | Postgres | 审计、LLM trace、lineage、DSAR 和留存策略 | PostgreSQL 16 |
-| Keycloak | OIDC SSO、RBAC 和 TOTP | 24.0.5 |
+| Keycloak | OIDC SSO、RBAC 和 TOTP | 26.7.2 |
 | Scheduler | 定时采集和每日留存清理 | APScheduler 3.x |
 
 ### 数据流
@@ -248,7 +248,7 @@ curl -X POST http://localhost:8001/v1/tag/recommend \
 | `CORS_ORIGINS` | 跨域白名单 | 默认空，同源内嵌管理页不需要配置 |
 | `TLS_ENABLED` | Secure Cookie | 接入 HTTPS 反向代理后设为 `true` |
 
-Compose 还要求填写 `POSTGRES_PASSWORD`、`JOYTAG_DB_PASSWORD`、`KEYCLOAK_DB_PASSWORD` 和 `KEYCLOAK_ADMIN_PASSWORD`。完整变量和示例注释以 [.env.example](.env.example) 为准。
+Compose 还要求填写 `POSTGRES_PASSWORD`、`JOYTAG_DB_PASSWORD`、`KEYCLOAK_DB_PASSWORD` 和 `KEYCLOAK_ADMIN_PASSWORD`。其中 `KEYCLOAK_ADMIN_PASSWORD` 仅用于首次启动或受控恢复引导，已有 Keycloak 用户的密码必须通过 Keycloak 管理操作实际修改。完整变量和示例注释以 [.env.example](.env.example) 为准。
 
 ## 生产部署
 
@@ -257,7 +257,7 @@ Compose 还要求填写 `POSTGRES_PASSWORD`、`JOYTAG_DB_PASSWORD`、`KEYCLOAK_D
 3. 将 GTE 模型权重单独准备到 `backend/models/gte-multilingual-base/`，或通过 `EMBEDDING_MODEL_PATH` 指定已挂载的模型目录；模型权重不随 Git 发布。
 4. 启动服务：`docker compose up -d --build`。
 5. 为 `8001` 和 `8080` 设置安全组白名单；不要把 Qdrant `6333/6334` 或 Postgres `5432` 暴露到公网。
-6. 通过 Keycloak 创建首个用户并分配 `admin` 角色；首次登录按要求绑定 TOTP。
+6. 通过 Keycloak 创建首个用户并分配 `admin` 角色；首次登录按要求绑定 TOTP。若现有管理员密码丢失，先在隔离数据库副本验证 Keycloak 26.7.2 的 `bootstrap-admin` 恢复流程，再按维护窗口执行升级；Keycloak 数据库迁移后不能只降级镜像回滚，必须同时恢复升级前数据库备份。
 7. 配置域名和 TLS 反向代理后，将 `TLS_ENABLED=true`，再开放管理端访问。
 
 建议上线前执行：
