@@ -3,6 +3,7 @@ from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock, patch
 
 from services import collector_state
+from services import db
 from services.collectors import cn_ecommerce
 from services.collectors import amazon_suggest
 
@@ -20,6 +21,24 @@ class _Response:
                 ["2026", "99"],
             ]
         }
+
+
+class DatabaseBatchExecutionTests(unittest.TestCase):
+    def test_execute_many_uses_cursor_executemany(self):
+        pool = MagicMock()
+        connection = pool.connection.return_value.__enter__.return_value
+        cursor = connection.cursor.return_value.__enter__.return_value
+
+        with (
+            patch.object(db, "_db_available", True),
+            patch.object(db, "get_pool", return_value=pool),
+        ):
+            db.execute_many("INSERT INTO test_table VALUES (%s)", [(1,)])
+
+        cursor.executemany.assert_called_once_with(
+            "INSERT INTO test_table VALUES (%s)", [(1,)]
+        )
+        connection.executemany.assert_not_called()
 
 
 class ChineseSourceTests(unittest.TestCase):
