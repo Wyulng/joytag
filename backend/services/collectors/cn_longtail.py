@@ -6,7 +6,8 @@ import logging
 from pathlib import Path
 from datetime import datetime, timezone
 from services.alignment import process_cn_longtail_word
-from services.collectors.cn_ecommerce import get_cn_trending_words
+from services.collectors.cn_ecommerce import get_cn_trending_words, get_last_collection_stats
+from services import collector_state
 from services.embedding import get_embeddings
 from services.qdrant_store import cn_anchor_exists
 from services.lineage import record_event, EVENT_START, EVENT_COMPLETE, EVENT_FAIL
@@ -15,6 +16,7 @@ logger = logging.getLogger(__name__)
 
 _SAVE_INTERVAL = 10
 _MAX_HISTORY = 1000
+_RUN_LOCK = asyncio.Lock()
 
 # 进度文件路径（基于项目根目录）
 BASE_DIR = Path(__file__).parent.parent.parent
@@ -59,8 +61,18 @@ async def _collect_cn_generator():
     progress = _load_progress()
     # 使用 dict 代替 set 以保留插入顺序，确保进度切片确定性
     processed_words: dict[str, None] = {w: None for w in progress.get("processed_words", [])}
+    processed_keys = {collector_state.normalize_collector_key(word) for word in processed_words}
 
-    words_with_heat = await fetch_cn_longtail_words()
+    try:
+        words_with_heat = await fetch_cn_longtail_words()
+    except Exception:
+        record_event(
+            run_id=run_id,
+            job_name="cn_collection",
+            event_type=EVENT_FAIL,
+            run_facets={"total": 0, "error": "fetch_cn_longtail_words failed"},
+        )
+        raise
     if not words_with_heat:
         record_event(run_id=run_id, job_name="cn_collection", event_type=EVENT_COMPLETE,
                      run_facets={"total": 0, "skipped": True})
@@ -69,49 +81,77 @@ async def _collect_cn_generator():
 
     total = len(words_with_heat)
 
-    # 检查哪些词是新词（不在进度文件中）
-    unprocessed = [w for w, _, _ in words_with_heat if w not in processed_words]
-    processed_count = total - len(unprocessed)
-
-    # 如果所有词都已在进度文件中，跳过
-    if not unprocessed:
-        logger.info(f"[cn] 词库已有 {processed_count} 条，全部已处理，跳过")
-        record_event(run_id=run_id, job_name="cn_collection", event_type=EVENT_COMPLETE,
-                     run_facets={"total": total, "skipped": True})
-        yield {
-            "event": "done",
-            "total": total,
-            "skipped": True,
-            "duplicates": total,
-            "new": 0,
-            "message": "已全部采集完成（无新词），等待新词出现"
-        }
-        return
-
-    logger.info(f"[cn] 词库已有 {processed_count} 条，剩余 {len(unprocessed)} 条待处理")
+    observation_keys = [collector_state.normalize_collector_key(word) for word, _, _ in words_with_heat]
+    observations = collector_state.get_candidate_observations("cn", "CN", observation_keys)
 
     duplicate_count = 0
     new_count = 0
     save_counter = 0
 
     try:
-        # 先完成数据库去重，再为本轮真正需要入库的新词批量编码。
-        # dict 保留原始顺序，并避免同一轮重复词被重复编码。
-        exists_by_word: dict[str, bool] = {}
+        # 先完成进度/观察表/Qdrant 去重，再为真正需要入库的新词批量编码。
+        # 观察表在 Postgres 可用时负责跨运行的规范化去重；本地无 Postgres 时
+        # 退回原有进度文件与 Qdrant 精确 ID 逻辑。
+        exists_by_key: dict[str, bool] = {}
         new_words: list[str] = []
-        for cn_word in unprocessed:
-            if cn_word in exists_by_word:
+        word_by_key: dict[str, str] = {}
+        for cn_word, _heat, _category in words_with_heat:
+            key = collector_state.normalize_collector_key(cn_word)
+            if not key or key in word_by_key:
+                continue
+            word_by_key[key] = cn_word
+            if key in processed_keys:
+                exists_by_key[key] = True
+                continue
+            observation = observations.get(key)
+            next_eligible = observation.get("next_eligible_at") if observation else None
+            if observation and (
+                observation.get("decision_status")
+                or (next_eligible is not None and next_eligible > datetime.now(timezone.utc))
+            ):
+                exists_by_key[key] = True
                 continue
             exists_in_db = cn_anchor_exists(cn_word)
-            exists_by_word[cn_word] = exists_in_db
+            exists_by_key[key] = exists_in_db
             if not exists_in_db:
                 new_words.append(cn_word)
         vectors = await get_embeddings(new_words) if new_words else []
-        vectors_by_word = dict(zip(new_words, vectors))
+        vectors_by_key = {
+            collector_state.normalize_collector_key(word): vector
+            for word, vector in zip(new_words, vectors)
+        }
+
+        if not new_words:
+            logger.info("[cn] 本轮候选均已处理或在观察冷却期内，跳过向量化")
+            record_event(
+                run_id=run_id,
+                job_name="cn_collection",
+                event_type=EVENT_COMPLETE,
+                run_facets={
+                    "total": total,
+                    "skipped": True,
+                    "duplicates": total,
+                    **get_last_collection_stats(),
+                    "embedding_words": 0,
+                    "assess_calls": 0,
+                },
+            )
+            yield {
+                "event": "done",
+                "total": total,
+                "skipped": True,
+                "duplicates": total,
+                "new": 0,
+                "message": "已全部采集完成（无新词），等待新词出现",
+                **get_last_collection_stats(),
+            }
+            return
 
         for i, (cn_word, heat, seed_category) in enumerate(words_with_heat):
-            # 跳过已处理的词
-            if cn_word in processed_words:
+            key = collector_state.normalize_collector_key(cn_word)
+
+            # 跳过已处理的词，包括规范化后的大小写/空白变体
+            if key in processed_keys:
                 duplicate_count += 1
                 yield {
                     "index": i + 1,
@@ -124,7 +164,7 @@ async def _collect_cn_generator():
 
             # 使用批处理前完成的去重结果；前序重复词入库后更新状态，
             # 保持原有逐词顺序下的幂等语义。
-            exists_in_db = exists_by_word.get(cn_word, False)
+            exists_in_db = exists_by_key.get(key, False)
 
             if exists_in_db:
                 # 词已在数据库中
@@ -138,15 +178,28 @@ async def _collect_cn_generator():
                         "source_type": "taobao_suggest",
                         "collection_run_id": run_id,
                         "collected_at": datetime.now(timezone.utc).isoformat(),
+                        "trend_score_source": "taobao_suggest_relative",
+                        "trend_score_is_absolute": False,
                     },
                     collection_run_id=run_id,
-                    vector=vectors_by_word[cn_word],
+                    vector=vectors_by_key[key],
+                    trend_score=heat,
+                    trend_score_source="taobao_suggest_relative",
                 )
                 new_count += 1
-                exists_by_word[cn_word] = True
+                exists_by_key[key] = True
+
+            collector_state.mark_candidate_processed(
+                "cn",
+                "CN",
+                cn_word,
+                decision_status="anchor",
+                run_id=run_id,
+            )
 
             # 更新进度（每 _SAVE_INTERVAL 次写一次磁盘）
             processed_words[cn_word] = None
+            processed_keys.add(key)
             save_counter += 1
             if save_counter % _SAVE_INTERVAL == 0:
                 history = list(processed_words.keys())[-_MAX_HISTORY:] if len(processed_words) > _MAX_HISTORY else list(processed_words.keys())
@@ -174,8 +227,20 @@ async def _collect_cn_generator():
         "processed_words": history,
         "last_time": datetime.now(timezone.utc).isoformat()
     })
-    record_event(run_id=run_id, job_name="cn_collection", event_type=EVENT_COMPLETE,
-                 run_facets={"total": total, "new": new_count, "duplicates": duplicate_count})
+    source_stats = get_last_collection_stats()
+    record_event(
+        run_id=run_id,
+        job_name="cn_collection",
+        event_type=EVENT_COMPLETE,
+        run_facets={
+            "total": total,
+            "new": new_count,
+            "duplicates": duplicate_count,
+            **source_stats,
+            "embedding_words": len(new_words),
+            "assess_calls": 0,
+        },
+    )
     yield {
         "event": "done",
         "total": total,
@@ -183,13 +248,20 @@ async def _collect_cn_generator():
         "duplicates": duplicate_count,
         "new": new_count,
         "run_id": run_id,
+        **source_stats,
+        "embedding_words": len(new_words),
+        "assess_calls": 0,
     }
 
 
 async def run_cn_collector():
-    final = None
-    async for p in _collect_cn_generator():
-        final = p
+    if _RUN_LOCK.locked():
+        return {"total": 0, "approved": 0, "pending": 0, "duplicates": 0,
+                "new": 0, "skipped": True, "message": "中文采集任务已在运行"}
+    async with _RUN_LOCK:
+        final = None
+        async for p in _collect_cn_generator():
+            final = p
     if final is None:
         return {"total": 0, "approved": 0, "pending": 0, "duplicates": 0, "new": 0, "skipped": False}
 

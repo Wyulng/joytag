@@ -20,6 +20,7 @@ _SOURCE_TIMEOUT = 280  # 单源整体超时（秒），超时降级空列表不�
 _SEED_TIMEOUT = 90     # 动态种子翻译整体超时（秒）：超时后剩余国家用固定种子，不再无限等 LLM
 _SAVE_INTERVAL = 10
 _MAX_HISTORY = 1000
+_RUN_LOCK = asyncio.Lock()
 
 # 进度文件路径（基于项目根目录）
 BASE_DIR = Path(__file__).parent.parent.parent
@@ -351,9 +352,21 @@ async def _collect_overseas_generator():
 
 
 async def run_overseas_collector():
-    final = None
-    async for p in _collect_overseas_generator():
-        final = p
+    if _RUN_LOCK.locked():
+        return {
+            "total": 0,
+            "approved": 0,
+            "pending": 0,
+            "rejected": 0,
+            "duplicates": 0,
+            "new": 0,
+            "skipped": True,
+            "message": "海外采集任务已在运行",
+        }
+    async with _RUN_LOCK:
+        final = None
+        async for p in _collect_overseas_generator():
+            final = p
     if final is None:
         return {"total": 0, "approved": 0, "pending": 0, "rejected": 0, "duplicates": 0, "new": 0, "skipped": False}
 

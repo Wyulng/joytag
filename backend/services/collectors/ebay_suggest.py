@@ -24,11 +24,11 @@ EBAY_AUTOSUG_URL = "https://autosug.ebay.com/autosug"
 EBAY_SITE_IDS = {"UK": 3, "DE": 77, "FR": 71, "IT": 101, "ES": 186, "NL": 146}
 
 
-def _fetch_suggestions(country: str, seed: str, seed_category: str | None) -> list[tuple[str, int, str | None]]:
+def _fetch_suggestions(country: str, seed: str, seed_category: str | None) -> list[tuple[str, int, str | None]] | None:
     """获取单个种子的 eBay 搜索建议。返回 list[(词, 排名, 种子类目)]。"""
     s_id = EBAY_SITE_IDS.get(country)
     if s_id is None:
-        return []
+        return None
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
         "Referer": "https://www.ebay.com/",
@@ -38,10 +38,10 @@ def _fetch_suggestions(country: str, seed: str, seed_category: str | None) -> li
     try:
         resp = requests.get(EBAY_AUTOSUG_URL, headers=headers, params=params, timeout=10)
         if resp.status_code != 200:
-            return []
+            return None
         data = resp.json()
         if not isinstance(data, list) or len(data) < 2 or not isinstance(data[1], list):
-            return []
+            return None
         suggestions = []
         for i, item in enumerate(data[1]):
             if not isinstance(item, str):
@@ -56,7 +56,7 @@ def _fetch_suggestions(country: str, seed: str, seed_category: str | None) -> li
         return suggestions
     except Exception as e:
         logger.debug(f"[ebay_suggest] {country} 建议请求失败: {seed} -> {e}")
-        return []
+        return None
 
 
 def get_ebay_suggest_words(

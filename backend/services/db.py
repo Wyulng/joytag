@@ -64,6 +64,14 @@ def execute(sql: str, params: tuple | None = None) -> None:
         conn.execute(sql, params)
 
 
+def execute_many(sql: str, params_seq) -> None:
+    """在一个连接中批量执行写操作，供采集元数据批量 upsert 使用。"""
+    _check_available()
+    with get_pool().connection() as conn:
+        with conn.transaction():
+            conn.executemany(sql, params_seq)
+
+
 def fetchone(sql: str, params: tuple | None = None) -> tuple | None:
     _check_available()
     with get_pool().connection() as conn:
@@ -169,6 +177,66 @@ def ensure_schema() -> None:
         days       INT NOT NULL,
         updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
     );
+
+    CREATE TABLE IF NOT EXISTS collector_source_snapshot (
+        source           TEXT NOT NULL,
+        country          TEXT NOT NULL DEFAULT '',
+        seed_hash        TEXT NOT NULL,
+        response         JSONB NOT NULL DEFAULT '[]'::jsonb,
+        response_hash    TEXT NOT NULL DEFAULT '',
+        last_fetched_at  TIMESTAMPTZ,
+        last_changed_at  TIMESTAMPTZ,
+        next_fetch_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+        unchanged_streak INT NOT NULL DEFAULT 0,
+        error_streak     INT NOT NULL DEFAULT 0,
+        etag             TEXT NOT NULL DEFAULT '',
+        last_modified    TEXT NOT NULL DEFAULT '',
+        PRIMARY KEY (source, country, seed_hash)
+    );
+    CREATE INDEX IF NOT EXISTS idx_collector_snapshot_due
+        ON collector_source_snapshot (source, country, next_fetch_at);
+
+    CREATE TABLE IF NOT EXISTS collector_candidate_observation (
+        pipeline              TEXT NOT NULL,
+        country               TEXT NOT NULL DEFAULT '',
+        normalized_word       TEXT NOT NULL,
+        display_word          TEXT NOT NULL,
+        source_set             JSONB NOT NULL DEFAULT '[]'::jsonb,
+        category              TEXT,
+        first_seen_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
+        last_seen_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
+        seen_count            INT NOT NULL DEFAULT 1,
+        last_processed_at     TIMESTAMPTZ,
+        next_eligible_at      TIMESTAMPTZ,
+        decision_status       TEXT,
+        source_heat_score     DOUBLE PRECISION NOT NULL DEFAULT 0,
+        last_collection_run_id TEXT NOT NULL DEFAULT '',
+        PRIMARY KEY (pipeline, country, normalized_word)
+    );
+    CREATE INDEX IF NOT EXISTS idx_collector_observation_due
+        ON collector_candidate_observation (pipeline, country, next_eligible_at);
+    CREATE INDEX IF NOT EXISTS idx_collector_observation_seen
+        ON collector_candidate_observation (pipeline, country, last_seen_at DESC);
+
+    CREATE TABLE IF NOT EXISTS collector_seed_frontier (
+        pipeline          TEXT NOT NULL DEFAULT 'cn',
+        normalized_seed   TEXT NOT NULL,
+        seed_word         TEXT NOT NULL,
+        seed_kind         TEXT NOT NULL,
+        category          TEXT,
+        parent_seed       TEXT,
+        seed_depth        INT NOT NULL DEFAULT 0,
+        source_heat_score DOUBLE PRECISION NOT NULL DEFAULT 0,
+        first_seen_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+        last_seen_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+        last_queried_at   TIMESTAMPTZ,
+        next_query_at     TIMESTAMPTZ,
+        query_count       INT NOT NULL DEFAULT 0,
+        active            BOOLEAN NOT NULL DEFAULT true,
+        PRIMARY KEY (pipeline, normalized_seed)
+    );
+    CREATE INDEX IF NOT EXISTS idx_collector_seed_due
+        ON collector_seed_frontier (pipeline, active, next_query_at, source_heat_score DESC);
     """
 
     seed_policy = f"""
