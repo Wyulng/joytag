@@ -164,7 +164,7 @@ Keycloak :8080（对外但安全组限办公 IP；realm 导入；MFA TOTP 强制
 
 **backend/web_ui.py + static/**：新页面 transparency/audit/dsar；页面路由加 `require_admin_session` 未登录 302；admin.js 加 credentials/CSRF 头/401 跳登录；pending.html 拒绝必填理由。
 
-**docker-compose.yml**（保持 v1 兼容）：qdrant 端口改绑 127.0.0.1 + 日志轮转 + 密钥改 env 必填；backend 端口改绑 + depends_on 加 postgres/keycloak；新增 postgres:16-alpine（127.0.0.1:5432、pgdata 卷、512M、pg_isready）；新增 keycloak:24.0.5（8080 对外但安全组限 IP、1G、`--import-realm`）；新增 keycloak/realm-export.json + init-keycloak-db.sql。
+**docker-compose.yml**（保持 v1 兼容，历史方案）：qdrant 端口改绑 127.0.0.1 + 日志轮转 + 密钥改 env 必填；backend 端口改绑 + depends_on 加 postgres/keycloak；新增 postgres:16-alpine（127.0.0.1:5432、pgdata 卷、512M、pg_isready）；原计划使用 keycloak:24.0.5（8080 对外但安全组限 IP、1G、`--import-realm`），现行实现已升级为 Keycloak 26.7.2；新增 keycloak/realm-export.json + init-keycloak-db.sql。非空 Realm 的客户端 mapper 和 redirect URI 通过幂等管理 API 迁移，不重复导入覆盖。
 
 **backend/requirements.txt**：+ authlib、psycopg[binary]、psycopg-pool、presidio-analyzer、itsdangerous、cryptography。
 
