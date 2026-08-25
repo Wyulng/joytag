@@ -79,14 +79,21 @@ class RecommendSchemaTests(unittest.TestCase):
             "/v1/disclosure/parameters",
             "/v1/transparency",
             "/v1/dsar/request",
-            "/admin/api/collect/overseas",
-            "/admin/api/collect/cn",
+            "/admin/api/collection/status",
             "/admin/api/pending",
             "/admin/api/tags",
         }
         self.assertTrue(expected.issubset(paths))
         self.assertNotIn("/admin/collect/overseas", paths)
         self.assertNotIn("/admin/pending", paths)
+        for removed_path in (
+            "/admin/api/collect/overseas",
+            "/admin/api/collect/cn",
+            "/admin/api/schedules",
+            "/admin/api/schedules/{schedule_id}",
+            "/admin/api/schedules/{schedule_id}/run",
+        ):
+            self.assertNotIn(removed_path, paths)
 
     def test_country_is_normalized_and_top_k_is_bounded(self):
         request = RecommendRequest(title="  wool coat  ", target_country="de", top_k=10)

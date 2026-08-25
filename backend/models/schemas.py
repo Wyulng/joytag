@@ -154,17 +154,6 @@ class AnchorListResponse(BaseModel):
     next_offset: int | str | None = None
 
 
-class UpdateScheduleRequest(BaseModel):
-    enabled: bool | None = None
-    cron: str | None = Field(default=None, min_length=9, max_length=100)
-    name: str | None = Field(default=None, min_length=1, max_length=200)
-
-    @field_validator("cron", "name")
-    @classmethod
-    def strip_optional_text(cls, value: str | None) -> str | None:
-        return value.strip() if value is not None else value
-
-
 class DisclosureParameter(BaseModel):
     key: str
     description: str

@@ -27,7 +27,6 @@ from models.schemas import (
     RecommendRequest, RecommendResponse, RecommendItem,
     LocalTagListResponse, LocalTagItem,
     AnchorListResponse, AnchorItem,
-    UpdateScheduleRequest,
     DisclosureParameter, DisclosureParameters,
     DsarCreateRequest, DsarCreateResponse, DsarSearchRequest,
     TransparencyResponse,
@@ -44,7 +43,6 @@ from services.qdrant_store import (
     list_blocked_decisions, count_blocked_decisions, delete_blocked_decision,
     get_dashboard_stats
 )
-from services.collectors import overseas_trends, cn_longtail
 from services.collectors.countries import EU_COUNTRIES
 from services.rule_manager import (
     add_safe_word, add_banned_word, get_safe_words, get_banned_words,
@@ -58,10 +56,8 @@ from services.recommend import (
     TOP_K_RECALL, RERANK_DEPTH,
 )
 from services.task_scheduler import (
-    init_scheduler, shutdown_scheduler, add_job, remove_job, reschedule,
-    run_job_now, validate_cron,
+    init_scheduler, shutdown_scheduler, get_collection_status,
 )
-from services.scheduler_store import list_schedules, add_schedule, delete_schedule, update_schedule, get_schedule
 from services.http_client import close_http_client
 from services.db import init_db
 from services.audit import record_event as audit_record_event, verify_chain, list_audit
@@ -562,96 +558,11 @@ async def recommend_tags(request: Request, req: RecommendRequest,
     )
     return build_recommend_response(items, total_candidates, filtered_count)
 
-# ==================== 采集器触发接口 ====================
-@app.post("/admin/api/collect/overseas")
-@audited("collect.overseas", "collection")
-async def trigger_overseas_collection(request: Request = None,
-                                      _auth=Depends(require_role("operator")),
-                                      _csrf=Depends(require_csrf)):
-    logger.info("[api] 触发海外采集")
-    stats = await overseas_trends.run_overseas_collector()
-    logger.info(f"[api] 海外采集完成: {stats}")
-    return {"status": "done", "message": "海外采集已完成", **stats}
-
-
-@app.post("/admin/api/collect/cn")
-@audited("collect.cn", "collection")
-async def trigger_cn_collection(request: Request = None,
-                                _auth=Depends(require_role("operator")),
-                                _csrf=Depends(require_csrf)):
-    logger.info("[api] 触发中文采集")
-    final = await cn_longtail.run_cn_collector()
-    logger.info(f"[api] 中文采集完成: {final}")
-    return {"status": "done", "message": "中文采集已完成", **final}
-
-
-@app.post("/admin/api/schedules/{schedule_id}/run")
-@audited("schedule.run", "schedule", resource_id_keys=("schedule_id",))
-async def run_schedule_now(schedule_id: str, request: Request = None,
-                           _auth=Depends(require_role("operator")),
-                           _csrf=Depends(require_csrf)):
-    """手动立即执行指定定时任务"""
-    return await run_job_now(schedule_id)
-
-# ==================== 定时任务调度接口 ====================
-@app.get("/admin/api/schedules")
-async def get_schedules(_auth=Depends(require_admin_session)):
-    """列出所有定时任务"""
-    return {"schedules": list_schedules()}
-
-
-@app.post("/admin/api/schedules")
-@audited("schedule.create", "schedule", snapshot_keys=("name", "task_type", "cron"))
-async def create_schedule(
-    request: Request = None,
-    name: str = Body(...),
-    task_type: str = Body(...),
-    cron: str = Body(...),
-    _auth=Depends(require_role("operator")),
-    _csrf=Depends(require_csrf)
-):
-    """创建新定时任务"""
-    if task_type not in ("cn", "overseas"):
-        raise HTTPException(status_code=400, detail="task_type must be 'cn' or 'overseas'")
-    try:
-        validate_cron(cron)
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    schedule = add_schedule(name=name, task_type=task_type, cron=cron)
-    add_job(schedule)
-    return {"success": True, "schedule": schedule.to_dict()}
-
-
-@app.delete("/admin/api/schedules/{schedule_id}")
-@audited("schedule.delete", "schedule", resource_id_keys=("schedule_id",))
-async def delete_schedule_api(schedule_id: str, request: Request = None,
-                              _auth=Depends(require_role("operator")),
-                              _csrf=Depends(require_csrf)):
-    """删除定时任务"""
-    remove_job(schedule_id)
-    deleted = delete_schedule(schedule_id)
-    if not deleted:
-        raise HTTPException(status_code=404, detail="任务不存在")
-    return {"success": True}
-
-
-@app.patch("/admin/api/schedules/{schedule_id}")
-@audited("schedule.update", "schedule", resource_id_keys=("schedule_id",), snapshot_keys=("req",))
-async def update_schedule_api(schedule_id: str, req: UpdateScheduleRequest, request: Request = None,
-                              _auth=Depends(require_role("operator")),
-                              _csrf=Depends(require_csrf)):
-    """更新定时任务（启用/禁用/修改cron）"""
-    payload = req.model_dump(exclude_none=True)
-    if "cron" in payload:
-        try:
-            validate_cron(payload["cron"])
-        except ValueError as e:
-            raise HTTPException(status_code=400, detail=str(e))
-    schedule = update_schedule(schedule_id, **payload)
-    if not schedule:
-        raise HTTPException(status_code=404, detail="任务不存在")
-    reschedule(schedule)
-    return {"success": True, "schedule": schedule.to_dict()}
+# ==================== 自动采集状态 ====================
+@app.get("/admin/api/collection/status")
+async def get_collection_status_api(_auth=Depends(require_admin_session)):
+    """只读返回固定自动采集任务状态；人工采集入口已关闭。"""
+    return get_collection_status()
 
 # ==================== 概览统计 ====================
 @app.get("/admin/api/stats")

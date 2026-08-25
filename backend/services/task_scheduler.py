@@ -1,19 +1,54 @@
+"""Fixed automatic collection scheduler.
+
+The service intentionally exposes no user-configurable cron jobs. Collection
+cadence is a product invariant so operators cannot accidentally create
+duplicate network/LLM work through the admin UI.
+"""
+
+from __future__ import annotations
+
 import asyncio
 import logging
+from datetime import datetime, timezone
+from typing import Any, Awaitable, Callable
+from uuid import uuid4
+from zoneinfo import ZoneInfo
+
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 
-from services.scheduler_store import load_schedules, touch_last_run, get_schedule
 from services.collectors.cn_longtail import run_cn_collector
 from services.collectors.overseas_trends import run_overseas_collector
 
 logger = logging.getLogger(__name__)
 
+SCHEDULER_TIMEZONE_NAME = "Asia/Shanghai"
+SCHEDULER_TIMEZONE = ZoneInfo(SCHEDULER_TIMEZONE_NAME)
+UTC = timezone.utc
+
+CN_JOB_ID = "auto_cn_collection"
+CN_CRON = "0 2 * * *"
+OVERSEAS_JOB_ID = "auto_overseas_collection"
+OVERSEAS_CRON = "0 4,16 * * *"
+RETENTION_JOB_ID = "compliance_retention"
+
+_JOB_OPTIONS = {
+    "replace_existing": True,
+    "coalesce": True,
+    "max_instances": 1,
+    "misfire_grace_time": 60,
+}
+
 _scheduler: AsyncIOScheduler | None = None
+_collection_lock = asyncio.Lock()
+_job_state: dict[str, dict[str, Any]] = {
+    CN_JOB_ID: {"running": False, "last_status": "never"},
+    OVERSEAS_JOB_ID: {"running": False, "last_status": "never"},
+}
 
 
-def _build_trigger(cron: str) -> CronTrigger:
-    """解析 cron 表达式构建 APScheduler CronTrigger"""
+def _build_trigger(cron: str, timezone_value: ZoneInfo = SCHEDULER_TIMEZONE) -> CronTrigger:
+    """Build a fixed five-field cron trigger with an explicit timezone."""
     parts = cron.split()
     if len(parts) != 5:
         raise ValueError(f"Invalid cron expression: {cron}")
@@ -23,131 +58,258 @@ def _build_trigger(cron: str) -> CronTrigger:
         day=parts[2],
         month=parts[3],
         day_of_week=parts[4],
+        timezone=timezone_value,
     )
 
 
-def validate_cron(cron: str) -> None:
-    """Validate a user-supplied five-field cron expression without scheduling it."""
-    _build_trigger(cron)
+def _now_iso() -> str:
+    return datetime.now(UTC).isoformat()
 
 
-async def _run_cn_async():
-    """后台执行中文采集（调度器回调）"""
+def _safe_result(result: Any) -> dict[str, Any]:
+    """Keep audit details aggregate-only and exclude raw collection data."""
+    if not isinstance(result, dict):
+        return {}
+    allowed = {
+        "total", "approved", "pending", "rejected", "duplicates", "new",
+        "skipped", "embedding_words", "assess_calls", "source_requests",
+        "source_cache_hits", "source_errors", "source_response_changes",
+        "seed_queries", "dynamic_seeds", "fixed_seeds", "raw_candidates",
+        "unique_candidates",
+    }
+    return {
+        key: value
+        for key, value in result.items()
+        if key in allowed and isinstance(value, (str, int, float, bool))
+    }
+
+
+async def _record_auto_audit(
+    action: str,
+    resource_id: str,
+    *,
+    status: str,
+    detail: dict[str, Any] | None = None,
+) -> None:
+    """Record scheduler activity without allowing audit failure to kill the loop."""
     try:
-        logger.info("[定时任务] 开始执行中文长尾词采集")
-        result = await run_cn_collector()
-        logger.info(f"[定时任务] 中文采集完成: {result}")
-    except Exception as e:
-        logger.error(f"[定时任务] 中文采集失败: {e}")
+        from services.audit import record_event
+
+        await asyncio.to_thread(
+            record_event,
+            actor_sub="system:scheduler",
+            actor_username="scheduler",
+            actor_roles=["system"],
+            action=action,
+            resource_type="collection",
+            resource_id=resource_id,
+            detail={"status": status, **(detail or {})},
+        )
+    except Exception as exc:
+        logger.error(
+            "[scheduler_audit_failed] action=%s status=%s error_type=%s",
+            action,
+            status,
+            type(exc).__name__,
+        )
 
 
-async def _run_overseas_async():
-    """后台执行海外采集（调度器回调）"""
-    try:
-        logger.info("[定时任务] 开始执行海外词采集")
-        result = await run_overseas_collector()
-        logger.info(f"[定时任务] 海外采集完成: {result}")
-    except Exception as e:
-        logger.error(f"[定时任务] 海外采集失败: {e}")
+def _set_job_state(job_id: str, **updates: Any) -> None:
+    _job_state.setdefault(job_id, {}).update(updates)
 
 
-async def _run_retention_async():
-    """每日留存清理（合规系统任务，2026-08；不进 schedules.json，配置在 retention_policy 表）"""
+async def _run_collection_job(
+    job_id: str,
+    task_type: str,
+    runner: Callable[[], Awaitable[dict]],
+) -> dict:
+    """Run one collection only when the shared collection lock is available."""
+    action = f"collect.{task_type}.auto"
+    resource_id = f"{job_id}:{uuid4()}"
+    if _collection_lock.locked():
+        _set_job_state(
+            job_id,
+            running=False,
+            last_status="skipped",
+            last_finished_at=_now_iso(),
+            last_detail={"reason": "collection_lock_busy"},
+        )
+        logger.info(
+            "[scheduler_job_skipped] job_id=%s task_type=%s reason=collection_lock_busy",
+            job_id,
+            task_type,
+        )
+        await _record_auto_audit(
+            action,
+            resource_id,
+            status="skipped",
+            detail={"reason": "collection_lock_busy"},
+        )
+        return {"skipped": True, "reason": "collection_lock_busy"}
+
+    async with _collection_lock:
+        started_at = _now_iso()
+        _set_job_state(
+            job_id,
+            running=True,
+            last_status="running",
+            last_started_at=started_at,
+        )
+        logger.info(
+            "[scheduler_job_started] job_id=%s task_type=%s timezone=%s",
+            job_id,
+            task_type,
+            SCHEDULER_TIMEZONE_NAME,
+        )
+        try:
+            result = await runner()
+        except Exception as exc:
+            _set_job_state(
+                job_id,
+                running=False,
+                last_status="failed",
+                last_finished_at=_now_iso(),
+                last_detail={"error_type": type(exc).__name__},
+            )
+            logger.error(
+                "[scheduler_job_failed] job_id=%s task_type=%s error_type=%s",
+                job_id,
+                task_type,
+                type(exc).__name__,
+            )
+            await _record_auto_audit(
+                action,
+                resource_id,
+                status="failed",
+                detail={"error_type": type(exc).__name__},
+            )
+            return {"skipped": False, "status": "failed"}
+
+        safe_result = _safe_result(result)
+        _set_job_state(
+            job_id,
+            running=False,
+            last_status="success",
+            last_finished_at=_now_iso(),
+            last_detail=safe_result,
+        )
+        logger.info(
+            "[scheduler_job_completed] job_id=%s task_type=%s result=%s",
+            job_id,
+            task_type,
+            safe_result,
+        )
+        await _record_auto_audit(
+            action,
+            resource_id,
+            status="success",
+            detail={"result": safe_result},
+        )
+        return result
+
+
+async def _run_cn_async() -> dict:
+    return await _run_collection_job(CN_JOB_ID, "cn", run_cn_collector)
+
+
+async def _run_overseas_async() -> dict:
+    return await _run_collection_job(OVERSEAS_JOB_ID, "overseas", run_overseas_collector)
+
+
+async def _run_retention_async() -> None:
+    """Daily retention cleanup remains a system task in UTC."""
     try:
         from services.retention import run_all_purges
-        logger.info("[定时任务] 开始执行合规留存清理")
+
+        logger.info("[scheduler_job_started] job_id=%s task_type=retention", RETENTION_JOB_ID)
         result = await asyncio.to_thread(run_all_purges)
-        logger.info(f"[定时任务] 留存清理完成: {result}")
-    except Exception as e:
-        logger.error(f"[定时任务] 留存清理失败: {e}")
+        logger.info("[scheduler_job_completed] job_id=%s task_type=retention result=%s", RETENTION_JOB_ID, result)
+    except Exception as exc:
+        logger.error(
+            "[scheduler_job_failed] job_id=%s task_type=retention error_type=%s",
+            RETENTION_JOB_ID,
+            type(exc).__name__,
+        )
 
 
-def init_scheduler():
-    """启动时从文件恢复所有启用的任务"""
+def _add_fixed_job(func: Callable, *, job_id: str, cron: str, timezone_value: ZoneInfo) -> None:
+    assert _scheduler is not None
+    _scheduler.add_job(
+        func,
+        _build_trigger(cron, timezone_value),
+        id=job_id,
+        **_JOB_OPTIONS,
+    )
+
+
+def init_scheduler() -> None:
+    """Register the fixed automatic jobs idempotently at application startup."""
     global _scheduler
     if _scheduler is not None:
         return
-    _scheduler = AsyncIOScheduler()
 
-    # 合规系统任务：每日 03:00 UTC 留存清理（GDPR Art.5(1)(e) 存储限制）
+    _scheduler = AsyncIOScheduler(timezone=SCHEDULER_TIMEZONE)
+    _add_fixed_job(
+        _run_cn_async,
+        job_id=CN_JOB_ID,
+        cron=CN_CRON,
+        timezone_value=SCHEDULER_TIMEZONE,
+    )
+    _add_fixed_job(
+        _run_overseas_async,
+        job_id=OVERSEAS_JOB_ID,
+        cron=OVERSEAS_CRON,
+        timezone_value=SCHEDULER_TIMEZONE,
+    )
     _scheduler.add_job(
         _run_retention_async,
-        CronTrigger(hour=3, minute=0, timezone="UTC"),
-        id="compliance_retention",
-        replace_existing=True,
+        CronTrigger(hour=3, minute=0, timezone=UTC),
+        id=RETENTION_JOB_ID,
+        **_JOB_OPTIONS,
     )
-    logger.info("[调度器] 已注册合规留存清理任务 (compliance_retention, 每日 03:00 UTC)")
-
-    for schedule in load_schedules():
-        if not schedule.enabled:
-            continue
-        try:
-            trigger = _build_trigger(schedule.cron)
-            func = _run_cn_async if schedule.task_type == "cn" else _run_overseas_async
-            _scheduler.add_job(func, trigger, id=schedule.id, replace_existing=True)
-            logger.info(f"[调度器] 已恢复任务: {schedule.name} ({schedule.id})")
-        except Exception as e:
-            logger.warning(f"[调度器] 恢复任务失败 {schedule.id}: {e}")
-
     _scheduler.start()
-    logger.info("[调度器] APScheduler 已启动")
+    logger.info(
+        "[scheduler_started] timezone=%s jobs=%s",
+        SCHEDULER_TIMEZONE_NAME,
+        [CN_JOB_ID, OVERSEAS_JOB_ID, RETENTION_JOB_ID],
+    )
 
 
-def shutdown_scheduler():
-    """关闭调度器"""
+def shutdown_scheduler() -> None:
+    """Stop the scheduler without touching collection data or progress files."""
     global _scheduler
     if _scheduler:
         _scheduler.shutdown(wait=True)
         _scheduler = None
-        logger.info("[调度器] APScheduler 已关闭")
+        logger.info("[scheduler_stopped]")
 
 
-def add_job(schedule) -> None:
-    """添加新任务到调度器"""
-    if _scheduler is None:
-        return
-    try:
-        trigger = _build_trigger(schedule.cron)
-        func = _run_cn_async if schedule.task_type == "cn" else _run_overseas_async
-        _scheduler.add_job(func, trigger, id=schedule.id, replace_existing=True)
-        logger.info(f"[调度器] 已添加任务: {schedule.name}")
-    except Exception as e:
-        logger.error(f"[调度器] 添加任务失败: {e}")
-        raise
-
-
-def remove_job(schedule_id: str) -> None:
-    """从调度器移除任务"""
-    if _scheduler is None:
-        return
-    try:
-        _scheduler.remove_job(schedule_id)
-        logger.info(f"[调度器] 已移除任务: {schedule_id}")
-    except Exception:
-        pass
-
-
-def reschedule(schedule) -> None:
-    """更新调度器中的任务"""
-    remove_job(schedule.id)
-    if schedule.enabled:
-        add_job(schedule)
-
-
-async def run_job_now(schedule_id: str) -> dict:
-    """立即手动执行指定任务（同步等待完成）"""
-    schedule = get_schedule(schedule_id)
-    if not schedule:
-        return {"success": False, "message": "任务不存在"}
-
-    touch_last_run(schedule_id)
-
-    try:
-        if schedule.task_type == "cn":
-            result = await run_cn_collector()
-        else:
-            result = await run_overseas_collector()
-        return {"success": True, "message": "执行完成", **result}
-    except Exception as e:
-        logger.error(f"[定时任务] 手动执行失败: {e}")
-        return {"success": False, "message": f"执行失败: {e}"}
+def get_collection_status() -> dict[str, Any]:
+    """Return read-only status for the fixed collection jobs."""
+    definitions = (
+        (CN_JOB_ID, "cn", CN_CRON),
+        (OVERSEAS_JOB_ID, "overseas", OVERSEAS_CRON),
+    )
+    jobs = []
+    for job_id, task_type, cron in definitions:
+        state = dict(_job_state.get(job_id, {}))
+        next_run = None
+        if _scheduler is not None:
+            job = _scheduler.get_job(job_id)
+            if job and job.next_run_time:
+                next_run = job.next_run_time.isoformat()
+        jobs.append(
+            {
+                "id": job_id,
+                "task_type": task_type,
+                "cron": cron,
+                "next_run_at": next_run,
+                "running": bool(state.pop("running", False)),
+                **state,
+            }
+        )
+    return {
+        "timezone": SCHEDULER_TIMEZONE_NAME,
+        "manual_collection_enabled": False,
+        "jobs": jobs,
+    }

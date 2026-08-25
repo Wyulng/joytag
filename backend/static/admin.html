@@ -131,37 +131,22 @@
     </section>
 
     <section id="tab-collect" hidden>
-      <h1>采集管理</h1>
-      <p class="sub">手动触发采集 + 定时任务（Cron）管理。采集耗时数分钟，请勿重复触发</p>
-      <h2>手动采集</h2>
+      <h1>自动采集</h1>
+      <p class="sub">系统固定自动采集：中文每日 02:00，海外每日 04:00 与 16:00（Asia/Shanghai）。人工采集和自定义 Cron 已关闭。</p>
       <div class="toolbar">
-        <button class="btn-primary" id="cl-btn-overseas">触发海外采集</button>
-        <button class="btn-primary" id="cl-btn-cn">触发中文采集</button>
-        <span id="cl-collect-result" class="muted"></span>
-      </div>
-      <h2>定时任务</h2>
-      <div class="toolbar">
-        <span class="field-label">名称</span>
-        <input id="cl-new-name" placeholder="任务名称" style="width:140px">
-        <span class="field-label">类型</span>
-        <select id="cl-new-type">
-          <option value="overseas">海外采集</option>
-          <option value="cn">中文采集</option>
-        </select>
-        <span class="field-label">Cron</span>
-        <input id="cl-new-cron" placeholder="分 时 日 月 周，如 */30 * * * *" style="width:200px">
-        <button class="btn-primary" id="cl-btn-create">新建</button>
+        <span class="badge info">人工采集已关闭</span>
         <span class="spacer"></span>
-        <button id="cl-btn-reload">刷新</button>
+        <button id="cl-btn-reload">刷新状态</button>
       </div>
-      <table>
-        <thead>
-          <tr>
-            <th>名称</th><th>类型</th><th>Cron</th><th>状态</th><th>上次运行</th><th>操作</th>
-          </tr>
-        </thead>
-        <tbody id="cl-tbody"></tbody>
-      </table>
+      <div id="cl-status-summary" class="muted"></div>
+      <div style="overflow-x:auto">
+        <table>
+          <thead>
+            <tr><th>任务</th><th>类型</th><th>Cron</th><th>时区</th><th>状态</th><th>下一次运行</th><th>最近完成</th></tr>
+          </thead>
+          <tbody id="cl-tbody"></tbody>
+        </table>
+      </div>
     </section>
 
     <section id="tab-rules" hidden>
@@ -261,12 +246,8 @@
           <option value="rule.add_safe">rule.add_safe</option>
           <option value="rule.remove_safe">rule.remove_safe</option>
           <option value="blocked.delete">blocked.delete</option>
-          <option value="collect.overseas">collect.overseas</option>
-          <option value="collect.cn">collect.cn</option>
-          <option value="schedule.create">schedule.create</option>
-          <option value="schedule.update">schedule.update</option>
-          <option value="schedule.delete">schedule.delete</option>
-          <option value="schedule.run">schedule.run</option>
+          <option value="collect.overseas.auto">collect.overseas.auto</option>
+          <option value="collect.cn.auto">collect.cn.auto</option>
         </select>
         <span class="spacer"></span>
         <button class="btn-danger" id="au-verify">校验哈希链</button>
@@ -555,105 +536,39 @@
       TABS.collect = { init: init };
       function init() {
         const TYPE_LABEL = { cn: '中文采集', overseas: '海外采集' };
-
-        // ===== 手动采集 =====
-        document.getElementById('cl-btn-overseas').addEventListener('click', function () {
-          triggerCollect('overseas', this);
-        });
-        document.getElementById('cl-btn-cn').addEventListener('click', function () {
-          triggerCollect('cn', this);
-        });
-
-        async function triggerCollect(type, btn) {
-          const other = btn.id === 'cl-btn-overseas'
-            ? document.getElementById('cl-btn-cn') : document.getElementById('cl-btn-overseas');
-          btn.disabled = true; other.disabled = true;
-          const resultEl = document.getElementById('cl-collect-result');
-          resultEl.textContent = type === 'overseas' ? '海外采集中，预计数分钟…' : '中文采集中，预计数分钟…';
-          try {
-            const res = await api(`/admin/api/collect/${type}`, { method: 'POST' });
-            const summary = Object.entries(res)
-              .filter(([k]) => k !== 'status' && k !== 'message')
-              .map(([k, v]) => `${k}=${v}`).join(', ');
-            resultEl.textContent = `完成：${res.message}` + (summary ? `（${summary}）` : '');
-            toast(res.message);
-          } catch (e) {
-            resultEl.textContent = '失败：' + e.message;
-            toast(e.message, false);
-          } finally {
-            btn.disabled = false; other.disabled = false;
-          }
+        const STATUS_LABEL = {
+          never: '未执行', running: '运行中', success: '成功',
+          failed: '失败', skipped: '已跳过',
+        };
+        function displayTime(value) {
+          return value ? esc(value.replace('T', ' ').slice(0, 19)) : '–';
         }
-
-        // ===== 定时任务 =====
-        function loadSchedules() {
-          api('/admin/api/schedules').then(data => {
-            const items = data.schedules || [];
+        function loadStatus() {
+          api('/admin/api/collection/status').then(data => {
+            const items = data.jobs || [];
+            document.getElementById('cl-status-summary').textContent =
+              `时区：${data.timezone}；人工采集：${data.manual_collection_enabled ? '开启' : '关闭'}`;
             const tbody = document.getElementById('cl-tbody');
-            if (!items.length) {
-              tbody.innerHTML = '<tr class="empty-row"><td colspan="6">暂无定时任务</td></tr>';
-              return;
-            }
-            tbody.innerHTML = items.map(s => `
-              <tr data-id="${esc(s.id)}">
-                <td><strong>${esc(s.name)}</strong></td>
-                <td>${esc(TYPE_LABEL[s.task_type] || s.task_type)}</td>
-                <td><code>${esc(s.cron)}</code></td>
-                <td><span class="badge ${s.enabled ? 'ok' : 'bad'}">${s.enabled ? '启用' : '停用'}</span></td>
-                <td class="muted">${esc(s.last_run ? s.last_run.replace('T', ' ').slice(0, 19) : '–')}</td>
-                <td style="white-space:nowrap">
-                  <button class="btn-sm run">立即运行</button>
-                  <button class="btn-sm toggle">${s.enabled ? '停用' : '启用'}</button>
-                  <button class="btn-sm edit">改Cron</button>
-                  <button class="btn-sm btn-danger del">删除</button>
-                </td>
-              </tr>`).join('');
-
-            tbody.querySelectorAll('tr[data-id]').forEach(tr => {
-              const id = tr.dataset.id;
-              tr.querySelector('.run').addEventListener('click', withLoading(tr.querySelector('.run'), async () => {
-                const res = await api(`/admin/api/schedules/${encodeURIComponent(id)}/run`, { method: 'POST' });
-                toast(res.message || '任务已触发');
-              }));
-              tr.querySelector('.toggle').addEventListener('click', withLoading(tr.querySelector('.toggle'), async () => {
-                const enabled = tr.querySelector('.badge').textContent === '停用';
-                await api(`/admin/api/schedules/${encodeURIComponent(id)}`, { method: 'PATCH', body: { enabled } });
-                toast(enabled ? '已启用' : '已停用');
-                loadSchedules();
-              }));
-              tr.querySelector('.edit').addEventListener('click', withLoading(tr.querySelector('.edit'), async () => {
-                const cron = prompt('新的 Cron 表达式（分 时 日 月 周）：', tr.querySelector('code').textContent);
-                if (cron === null) return;
-                await api(`/admin/api/schedules/${encodeURIComponent(id)}`, { method: 'PATCH', body: { cron: cron.trim() } });
-                toast('Cron 已更新');
-                loadSchedules();
-              }));
-              tr.querySelector('.del').addEventListener('click', withLoading(tr.querySelector('.del'), async () => {
-                if (!confirm(`确定删除任务「${tr.querySelector('td strong').textContent}」？`)) return;
-                await api(`/admin/api/schedules/${encodeURIComponent(id)}`, { method: 'DELETE' });
-                toast('任务已删除');
-                loadSchedules();
-              }));
-            });
+            tbody.innerHTML = items.length ? items.map(job => {
+              const status = job.last_status || 'never';
+              const badge = status === 'success' ? 'ok'
+                : status === 'failed' ? 'bad'
+                : status === 'running' ? 'info'
+                : status === 'skipped' ? 'warn' : '';
+              return `<tr>
+                <td><code>${esc(job.id)}</code></td>
+                <td>${esc(TYPE_LABEL[job.task_type] || job.task_type)}</td>
+                <td><code>${esc(job.cron)}</code></td>
+                <td>${esc(data.timezone)}</td>
+                <td><span class="badge ${badge}">${esc(STATUS_LABEL[status] || status)}</span></td>
+                <td class="muted">${displayTime(job.next_run_at)}</td>
+                <td class="muted">${displayTime(job.last_finished_at)}</td>
+              </tr>`;
+            }).join('') : '<tr class="empty-row"><td colspan="7">自动任务尚未初始化</td></tr>';
           }).catch(e => toast(e.message, false));
         }
-
-        document.getElementById('cl-btn-create').addEventListener('click', withLoading(document.getElementById('cl-btn-create'), async () => {
-          const name = document.getElementById('cl-new-name').value.trim();
-          const cron = document.getElementById('cl-new-cron').value.trim();
-          if (!name || !cron) { toast('请填写名称和 Cron 表达式', false); return; }
-          await api('/admin/api/schedules', {
-            method: 'POST',
-            body: { name, task_type: document.getElementById('cl-new-type').value, cron },
-          });
-          toast('任务已创建');
-          document.getElementById('cl-new-name').value = '';
-          document.getElementById('cl-new-cron').value = '';
-          loadSchedules();
-        }));
-        document.getElementById('cl-btn-reload').addEventListener('click', loadSchedules);
-
-        loadSchedules();
+        document.getElementById('cl-btn-reload').addEventListener('click', loadStatus);
+        loadStatus();
       }
     })();
 
