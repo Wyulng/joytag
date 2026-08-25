@@ -257,8 +257,9 @@ Compose 还要求填写 `POSTGRES_PASSWORD`、`JOYTAG_DB_PASSWORD`、`KEYCLOAK_D
 3. 将 GTE 模型权重单独准备到 `backend/models/gte-multilingual-base/`，或通过 `EMBEDDING_MODEL_PATH` 指定已挂载的模型目录；模型权重不随 Git 发布。
 4. 启动服务：`docker compose up -d --build`。
 5. 为 `8001` 和 `8080` 设置安全组白名单；不要把 Qdrant `6333/6334` 或 Postgres `5432` 暴露到公网。
-6. 通过 Keycloak 创建首个用户并分配 `admin` 角色；首次登录按要求绑定 TOTP。若现有管理员密码丢失，先在隔离数据库副本验证 Keycloak 26.7.2 的 `bootstrap-admin` 恢复流程，再按维护窗口执行升级；Keycloak 数据库迁移后不能只降级镜像回滚，必须同时恢复升级前数据库备份。
-7. 配置域名和 TLS 反向代理后，将 `TLS_ENABLED=true`，再开放管理端访问。
+6. 通过 Keycloak 在 `joytag` Realm 创建首个应用用户并分配 `admin` 角色；首次登录按要求绑定 TOTP。`joytag-admin` 客户端必须保留 `joytag-admin-realm-roles` mapper，将 realm roles 写入 ID Token 的 `realm_access.roles`，Backend 据此建立管理会话。生产回调地址为 `http://43.128.130.240:8001/*`，本地开发回调地址保留为 `http://localhost:8000/*` 和 `http://localhost:8001/*`。
+7. 对已有的非空 Realm，不要重复执行 `--import-realm` 覆盖配置。发布后使用 master 管理员通过 Keycloak 管理 API 或 `kcadm` 幂等补齐 `joytag-admin` mapper 和生产 redirect URI：先备份客户端 JSON，按稳定 mapper 名称查询，缺失则创建、配置不一致则更新，确认只存在一个同名 mapper 后再进行 PKCE 登录验证。创建测试 operator 时补齐 Keycloak 26 用户资料字段并清空 required actions；测试完成后删除临时用户。若现有管理员密码丢失，先在隔离数据库副本验证 Keycloak 26.7.2 的 `bootstrap-admin` 恢复流程，再按维护窗口执行升级；Keycloak 数据库迁移后不能只降级镜像回滚，必须同时恢复升级前数据库备份。
+8. 配置域名和 TLS 反向代理后，将 `TLS_ENABLED=true`，再开放管理端访问。
 
 建议上线前执行：
 

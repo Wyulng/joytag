@@ -264,7 +264,7 @@ flowchart LR
 | LLM | provider 适配层 | 默认 DeepSeek 的 OpenAI-compatible 接口，可配置 Azure 和 Bedrock |
 | 向量库 | Qdrant 1.9.0 | 四个集合、余弦距离、确定性 ID、payload 保存 provenance |
 | 合规数据库 | PostgreSQL 16 | audit、llm_trace、lineage、DSAR 和 retention 数据 |
-| 身份与权限 | Keycloak 24.0.5 | OIDC、RBAC、TOTP、服务间 scope 和会话 CSRF |
+| 身份与权限 | Keycloak 26.7.2 | OIDC、RBAC、TOTP、服务间 scope 和会话 CSRF；管理客户端 ID Token 通过 realm-role mapper 携带 `realm_access.roles` |
 | 调度 | APScheduler 3.x | 采集任务、手动运行和每日留存清理 |
 
 ### 3.3.3 数据采集与语义处理流程

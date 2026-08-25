@@ -18,6 +18,36 @@ def _candidate(word: str, similarity: float, **metadata):
 
 
 class KeycloakRealmContractTests(unittest.TestCase):
+    def test_admin_client_emits_realm_roles_in_id_token(self):
+        realm_path = Path(__file__).resolve().parents[2] / "keycloak" / "realm-export.json"
+        realm = json.loads(realm_path.read_text(encoding="utf-8"))
+        admin_client = next(
+            client
+            for client in realm["clients"]
+            if client.get("clientId") == "joytag-admin"
+        )
+
+        role_mappers = [
+            mapper
+            for mapper in admin_client.get("protocolMappers", [])
+            if mapper.get("name") == "joytag-admin-realm-roles"
+        ]
+        self.assertEqual(len(role_mappers), 1)
+        mapper = role_mappers[0]
+        self.assertEqual(mapper.get("protocol"), "openid-connect")
+        self.assertEqual(
+            mapper.get("protocolMapper"), "oidc-usermodel-realm-role-mapper"
+        )
+        self.assertEqual(mapper["config"].get("claim.name"), "realm_access.roles")
+        self.assertEqual(mapper["config"].get("multivalued"), "true")
+        self.assertEqual(mapper["config"].get("id.token.claim"), "true")
+        self.assertEqual(mapper["config"].get("access.token.claim"), "false")
+        self.assertEqual(
+            len(admin_client.get("redirectUris", [])),
+            len(set(admin_client.get("redirectUris", []))),
+        )
+        self.assertIn("http://43.128.130.240:8001/*", admin_client["redirectUris"])
+
     def test_service_token_includes_backend_audience(self):
         realm_path = Path(__file__).resolve().parents[2] / "keycloak" / "realm-export.json"
         realm = json.loads(realm_path.read_text(encoding="utf-8"))

@@ -48,10 +48,26 @@
       "serviceAccountsEnabled": false,
       "clientAuthenticatorType": "client-secret",
       "protocol": "openid-connect",
+      "protocolMappers": [
+        {
+          "name": "joytag-admin-realm-roles",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-usermodel-realm-role-mapper",
+          "consentRequired": false,
+          "config": {
+            "multivalued": "true",
+            "userinfo.token.claim": "false",
+            "id.token.claim": "true",
+            "access.token.claim": "false",
+            "claim.name": "realm_access.roles",
+            "jsonType.label": "String"
+          }
+        }
+      ],
       "redirectUris": [
         "http://localhost:8000/*",
         "http://localhost:8001/*",
-        "http://localhost:8001/*"
+        "http://43.128.130.240:8001/*"
       ],
       "webOrigins": [ "+" ],
       "attributes": {
