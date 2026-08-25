@@ -17,6 +17,7 @@ import requests
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from services.collectors.countries import EU_COUNTRIES
+from services import collector_state
 
 logger = logging.getLogger(__name__)
 
@@ -116,11 +117,11 @@ def close_fetch_executor() -> None:
         executor.shutdown(wait=True, cancel_futures=True)
 
 
-def _fetch_suggestions(country: str, seed: str, seed_category: str | None) -> list[tuple[str, int, str | None]]:
+def _fetch_suggestions(country: str, seed: str, seed_category: str | None) -> list[tuple[str, int, str | None]] | None:
     """获取单个种子的 Amazon 搜索建议。返回 list[(词, 排名, 种子类目)]。"""
     site = SITE_MAP.get(country)
     if not site:
-        return []
+        return None
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
         "Referer": f"https://www.amazon.{site['domain']}/",
@@ -139,7 +140,7 @@ def _fetch_suggestions(country: str, seed: str, seed_category: str | None) -> li
             headers=headers, params=params, timeout=10
         )
         if resp.status_code != 200:
-            return []
+            return None
         data = resp.json()
         suggestions = []
         for i, item in enumerate(data.get("suggestions", [])):
@@ -152,7 +153,7 @@ def _fetch_suggestions(country: str, seed: str, seed_category: str | None) -> li
         return suggestions
     except Exception as e:
         logger.debug(f"[amazon_suggest] {country} 建议请求失败: {seed} -> {e}")
-        return []
+        return None
 
 
 def score_suggestions(
@@ -183,6 +184,7 @@ def fanout_fetch(
     source_name: str,
     max_workers: int = OVERSEAS_FETCH_WORKERS,
     fallback_seeds: dict[str, list[tuple[str, str | None]]] | None = None,
+    cache_sources: bool = True,
 ) -> list[dict]:
     """跨国扁平扇出（amazon/ebay 共用）：共享 executor 覆盖全部 (国家, 种子) 对。
 
@@ -192,9 +194,15 @@ def fanout_fetch(
     """
     fallback_seeds = fallback_seeds if fallback_seeds is not None else {}
     jobs: list[tuple[str, str, str | None]] = []
+    seen_jobs: set[tuple[str, str]] = set()
     for c in countries:
         seeds = seeds_by_country.get(c) or fallback_seeds.get(c) or []
-        jobs.extend((c, s, cat) for s, cat in seeds)
+        for seed, category in seeds:
+            key = (c, collector_state.normalize_collector_key(seed))
+            if not key[1] or key in seen_jobs:
+                continue
+            seen_jobs.add(key)
+            jobs.append((c, seed, category))
 
     if not jobs:
         return []
@@ -208,12 +216,34 @@ def fanout_fetch(
             OVERSEAS_FETCH_WORKERS,
         )
     executor = _get_fetch_executor()
-    futures = {executor.submit(fetch_fn, c, s, cat): (c, s) for c, s, cat in jobs}
+    futures = {}
+    snapshots = {}
+    for country, seed, category in jobs:
+        snapshot = None
+        if cache_sources:
+            snapshot = collector_state.get_source_snapshot(source_name, country, seed)
+            snapshots[(country, seed)] = snapshot
+        if cache_sources and collector_state.source_snapshot_is_fresh(snapshot):
+            cached = (snapshot or {}).get("response") or []
+            if isinstance(cached, list):
+                by_country[country].extend(cached)
+            continue
+        futures[executor.submit(fetch_fn, country, seed, category)] = (country, seed)
     for future in as_completed(futures):
-        country, _ = futures[future]
+        country, seed = futures[future]
         try:
-            by_country[country].extend(future.result())
+            fetched = future.result()
+            if fetched is None:
+                raise RuntimeError("source request returned no valid response")
+            by_country[country].extend(fetched)
+            if cache_sources:
+                collector_state.save_source_snapshot(source_name, country, seed, fetched)
         except Exception as e:
+            if cache_sources:
+                collector_state.record_source_error(source_name, country, seed)
+                cached = (snapshots.get((country, seed)) or {}).get("response") or []
+                if isinstance(cached, list):
+                    by_country[country].extend(cached)
             logger.debug(f"[{source_name}] 扇出任务异常: {e}")
 
     results = []
@@ -281,7 +311,8 @@ def get_country_hot_words(country: str, limit: int = 10) -> list[dict]:
     def _refresh() -> None:
         try:
             words = fanout_fetch([country], {}, _fetch_suggestions, "amazon_suggest",
-                                 fallback_seeds=SEEDS_BY_COUNTRY)
+                                 fallback_seeds=SEEDS_BY_COUNTRY,
+                                 cache_sources=False)
         except Exception as e:
             logger.warning(f"[amazon_suggest] {country} 热词刷新异常: {e}")
             words = []

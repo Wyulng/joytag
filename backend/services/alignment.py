@@ -37,7 +37,9 @@ def _record_word_lineage(run_id: str, job_name: str, collection: str, word: str,
 # ==================== 处理中文长尾词（底座建设） ====================
 async def process_cn_longtail_word(cn_word: str, category: str = None,
                                    provenance: dict = None, collection_run_id: str = None,
-                                   vector: list[float] | None = None):
+                                   vector: list[float] | None = None,
+                                   trend_score: float = 0.0,
+                                   trend_score_source: str | None = None):
     """
     处理中文长尾词（纯概念底座，不做翻译）：
     1. 生成中文原文向量
@@ -49,7 +51,14 @@ async def process_cn_longtail_word(cn_word: str, category: str = None,
     vector = vector if vector is not None else await get_embedding(cn_word)
 
     # 存入中文锚点库
-    anchor_id = upsert_cn_anchor(cn_word, vector, category=category, provenance=provenance)
+    anchor_id = upsert_cn_anchor(
+        cn_word,
+        vector,
+        category=category,
+        provenance=provenance,
+        trend_score=trend_score,
+        trend_score_source=trend_score_source,
+    )
     logger.info(f"[alignment] 中文锚点入库成功: {cn_word} (id={anchor_id})")
     _record_word_lineage(collection_run_id or "manual", "cn_collection", "cn_anchors",
                          cn_word, None, "inserted")

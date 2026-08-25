@@ -85,6 +85,19 @@ flowchart LR
     -> local_tags、pending_review 或 blocked_decisions
 ~~~
 
+#### 中文锚点采集
+
+~~~text
+固定中文类目种子（bootstrap）+ 最近锚点/高热度建议词动态种子
+    -> 每轮最多查询 80 个种子（动态最多 64，固定最多 16）
+    -> 淘宝 suggest 参数化请求，解析返回的相对热度字段
+    -> 单响应 log1p 归一化 + 位置分，跨种子合并去重
+    -> 新词优先；已处理词按 30 天复检周期，近期旧词不再补满批次
+    -> GTE 批量向量化后写入 cn_anchors
+~~~
+
+中文采集使用 `CN_SOURCE_MODE=taobao_suggest`。淘宝公开 suggest 接口当前不提供可直接依赖的全局热榜、分页或时间范围参数，因此系统把响应第二字段解释为“当前响应内部的相对热度”，不把它当作真实搜索量、销量或成交量。来源响应、候选观察和动态种子 frontier 在 Postgres 可用时持久化，并分别使用 24 小时起步的来源退避、动态种子 7 天冷却和固定种子每日轮换；本地无 Postgres 时退回进程内状态，不影响开发采集。
+
 #### 推荐请求
 
 ~~~text
@@ -100,7 +113,7 @@ flowchart LR
 
 | 集合 | 内容 | 写入条件 |
 | --- | --- | --- |
-| `cn_anchors` | 中文商品锚点 | 采集、去重、向量化后写入 |
+| `cn_anchors` | 中文商品锚点 | 动态/固定种子采集、去重、向量化后写入 |
 | `local_tags` | 可复用的本地化 Tag | 通过规则和合规评估后写入 |
 | `pending_review` | 需要人工判断的词条 | 无中文锚点或 LLM 返回“存疑” |
 | `blocked_decisions` | 被拦截词的决策证据 | 保存国家、理由、规则 ID 和来源 |
@@ -240,6 +253,7 @@ curl -X POST http://localhost:8001/v1/tag/recommend \
 | `EMBEDDING_MODEL_REVISION` | 远程模型固定版本 | 默认 `9bbca17d9273fd0d03d5725c7a4b0f6b45142062` |
 | `EMBEDDING_DEVICE` / `EMBEDDING_NORMALIZE` | 推理设备与向量归一化 | 默认 `cpu` / `true`，支持 `auto`、`cuda` |
 | `ANCHOR_MATCH_THRESHOLD` / `ANCHOR_MATCH_UNCATEGORIZED_THRESHOLD` | 海外词到中文锚点的匹配阈值 | 默认 `0.60` / `0.75`；阈值必须在 0-1 之间 |
+| `CN_SOURCE_MODE` | 中文采集来源 | 默认 `taobao_suggest`；官方关键词推荐接口只作为后续 shadow 对比，不自动切换 |
 | `DATABASE_URL` | 合规数据库 | Compose 自动注入容器内地址 |
 | `AUTH_ENABLED` | 管理端认证 | 本地开发为 `false`；生产必须为 `true` |
 | `OIDC_ISSUER` / `OIDC_JWKS_URL` / `OIDC_TOKEN_URL` | Keycloak OIDC | 外部 issuer 与容器内 token/JWKS 地址可分开配置 |
@@ -259,6 +273,7 @@ Compose 还要求填写 `POSTGRES_PASSWORD`、`JOYTAG_DB_PASSWORD`、`KEYCLOAK_D
 4. 启动服务：`docker compose up -d --build`。
 5. 为 `8001` 和 `8080` 设置安全组白名单；不要把 Qdrant `6333/6334` 或 Postgres `5432` 暴露到公网。
 6. 通过 Keycloak 在 `joytag` Realm 创建首个应用用户并分配 `admin` 角色；首次登录按要求绑定 TOTP。`joytag-admin` 客户端必须保留 `joytag-admin-realm-roles` mapper，将 realm roles 写入 ID Token 的 `realm_access.roles`，Backend 据此建立管理会话。生产回调地址为 `http://43.128.130.240:8001/*`，本地开发回调地址保留为 `http://localhost:8000/*` 和 `http://localhost:8001/*`。
+7. 推荐将中文采集配置为每日一次、海外采集配置为每 6 小时一次；动态中文种子在下一轮中文任务生效。调度器不会在升级代码时自动创建生产任务，需由管理员在管理 API 中显式保存 cron 配置。
 7. 对已有的非空 Realm，不要重复执行 `--import-realm` 覆盖配置。发布后使用 master 管理员通过 Keycloak 管理 API 或 `kcadm` 幂等补齐 `joytag-admin` mapper 和生产 redirect URI：先备份客户端 JSON，按稳定 mapper 名称查询，缺失则创建、配置不一致则更新，确认只存在一个同名 mapper 后再进行 PKCE 登录验证。创建测试 operator 时补齐 Keycloak 26 用户资料字段并清空 required actions；测试完成后删除临时用户。若现有管理员密码丢失，先在隔离数据库副本验证 Keycloak 26.7.2 的 `bootstrap-admin` 恢复流程，再按维护窗口执行升级；Keycloak 数据库迁移后不能只降级镜像回滚，必须同时恢复升级前数据库备份。
 8. 配置域名和 TLS 反向代理后，将 `TLS_ENABLED=true`，再开放管理端访问。
 

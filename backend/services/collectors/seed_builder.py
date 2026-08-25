@@ -76,10 +76,7 @@ def _save_cache(cache: dict):
 
 
 def get_recent_anchor_words(limit: int = _RECENT_ANCHOR_LIMIT) -> list[tuple[str, str | None]]:
-    """取最新 limit 个中文锚点（created_at 倒序），返回 [(cn_word, category)]。
-
-    重复 upsert 会刷新 created_at，因此最新 = 最近活跃锚点，语义符合种子诉求。
-    """
+    """取最新 limit 个中文锚点（首次发现时间倒序），返回 [(cn_word, category)]。"""
     if limit <= 0:
         return []
 
@@ -96,13 +93,14 @@ def get_recent_anchor_words(limit: int = _RECENT_ANCHOR_LIMIT) -> list[tuple[str
     recent: list[tuple[str, str | None, str]] = []
     for record in _iter_scroll(
         ANCHOR_COLLECTION,
-        payload_keys=["cn_word", "category", "created_at"],
+        payload_keys=["cn_word", "category", "created_at", "first_seen_at"],
     ):
         payload = record.payload or {}
         word = payload.get("cn_word")
         if not word:
             continue
-        recent.append((word, payload.get("category"), payload.get("created_at") or ""))
+        first_seen = payload.get("first_seen_at") or payload.get("created_at") or ""
+        recent.append((word, payload.get("category"), first_seen))
         recent.sort(key=lambda item: (-sort_timestamp(item[2]), item[0]))
         if len(recent) > limit:
             recent.pop()

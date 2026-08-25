@@ -138,7 +138,9 @@ def _scroll_all(
 
 # ==================== 中文锚点操作 ====================
 def upsert_cn_anchor(cn_word: str, vector: list[float], category: str = None,
-                     provenance: dict = None, updated_at: str | None = None) -> str:
+                     provenance: dict = None, updated_at: str | None = None,
+                     trend_score: float = 0.0,
+                     trend_score_source: str | None = None) -> str:
     """存储中文锚点词，返回锚点 ID（仅含中文词+向量，不含六国翻译）
     同一 cn_word 多次调用会更新而非重复创建。
     provenance: 溯源元数据（source_type/collection_run_id/collected_at），EU 合规改造新增。
@@ -148,14 +150,18 @@ def upsert_cn_anchor(cn_word: str, vector: list[float], category: str = None,
     now = datetime.now(timezone.utc).isoformat()
     payload = {
         "cn_word": cn_word,
-        "created_at": now
+        "created_at": now,
+        "first_seen_at": (provenance or {}).get("collected_at") or now,
+        "updated_at": updated_at or now,
+        "trend_score": float(trend_score or 0.0),
+        "trend_score_is_absolute": False,
     }
+    if trend_score_source:
+        payload["trend_score_source"] = trend_score_source
     if category:
         payload["category"] = category
     if provenance:
         payload["provenance"] = provenance
-    if updated_at:
-        payload["updated_at"] = updated_at
     _add_embedding_metadata(payload)
     client.upsert(
         collection_name=ANCHOR_COLLECTION,
