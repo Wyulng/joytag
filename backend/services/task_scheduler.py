@@ -31,12 +31,19 @@ CN_CRON = "0 2 * * *"
 OVERSEAS_JOB_ID = "auto_overseas_collection"
 OVERSEAS_CRON = "0 4,16 * * *"
 RETENTION_JOB_ID = "compliance_retention"
+DAILY_REPORT_JOB_ID = "daily_collection_report"
+DAILY_REPORT_CRON = "0 9 * * *"
 
 _JOB_OPTIONS = {
     "replace_existing": True,
     "coalesce": True,
     "max_instances": 1,
     "misfire_grace_time": 60,
+}
+_REPORT_JOB_OPTIONS = {
+    **_JOB_OPTIONS,
+    # A restart around 09:00 may miss the report window; catch up within one hour.
+    "misfire_grace_time": 3600,
 }
 
 _scheduler: AsyncIOScheduler | None = None
@@ -90,6 +97,7 @@ async def _record_auto_audit(
     *,
     status: str,
     detail: dict[str, Any] | None = None,
+    resource_type: str = "collection",
 ) -> None:
     """Record scheduler activity without allowing audit failure to kill the loop."""
     try:
@@ -101,7 +109,7 @@ async def _record_auto_audit(
             actor_username="scheduler",
             actor_roles=["system"],
             action=action,
-            resource_type="collection",
+            resource_type=resource_type,
             resource_id=resource_id,
             detail={"status": status, **(detail or {})},
         )
@@ -232,6 +240,53 @@ async def _run_retention_async() -> None:
         )
 
 
+async def _run_daily_report_async() -> dict[str, Any]:
+    """Generate the local-delivery report without touching collection inputs."""
+    from services.daily_report import generate_daily_report
+
+    report_date = datetime.now(SCHEDULER_TIMEZONE).date().isoformat()
+    resource_id = f"daily-report:{report_date}"
+    try:
+        report = await generate_daily_report()
+    except Exception as exc:
+        logger.error(
+            "[daily_report_failed] report_date=%s error_type=%s",
+            report_date,
+            type(exc).__name__,
+        )
+        await _record_auto_audit(
+            "report.daily.auto",
+            resource_id,
+            status="failed",
+            resource_type="daily_report",
+            detail={"report_date": report_date, "error_type": type(exc).__name__},
+        )
+        return {"status": "failed", "report_date": report_date}
+
+    status = str(report.get("status", "degraded"))
+    safe_detail = {
+        "report_date": report.get("report_date", report_date),
+        "warning_count": len(report.get("warnings") or []),
+        "error_count": len(report.get("errors") or []),
+        "status": status,
+    }
+    logger.info(
+        "[daily_report_completed] report_date=%s status=%s warnings=%d errors=%d",
+        safe_detail["report_date"],
+        status,
+        safe_detail["warning_count"],
+        safe_detail["error_count"],
+    )
+    await _record_auto_audit(
+        "report.daily.auto",
+        resource_id,
+        status=status,
+        resource_type="daily_report",
+        detail=safe_detail,
+    )
+    return {"status": status, "report_date": safe_detail["report_date"]}
+
+
 def _add_fixed_job(func: Callable, *, job_id: str, cron: str, timezone_value: ZoneInfo) -> None:
     assert _scheduler is not None
     _scheduler.add_job(
@@ -267,11 +322,17 @@ def init_scheduler() -> None:
         id=RETENTION_JOB_ID,
         **_JOB_OPTIONS,
     )
+    _scheduler.add_job(
+        _run_daily_report_async,
+        _build_trigger(DAILY_REPORT_CRON, SCHEDULER_TIMEZONE),
+        id=DAILY_REPORT_JOB_ID,
+        **_REPORT_JOB_OPTIONS,
+    )
     _scheduler.start()
     logger.info(
         "[scheduler_started] timezone=%s jobs=%s",
         SCHEDULER_TIMEZONE_NAME,
-        [CN_JOB_ID, OVERSEAS_JOB_ID, RETENTION_JOB_ID],
+        [CN_JOB_ID, OVERSEAS_JOB_ID, RETENTION_JOB_ID, DAILY_REPORT_JOB_ID],
     )
 
 

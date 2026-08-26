@@ -21,7 +21,7 @@ class FixedSchedulerTests(unittest.TestCase):
         self.assertEqual(retention_trigger.timezone, task_scheduler.UTC)
         self.assertEqual(task_scheduler.OVERSEAS_CRON, "0 4,16 * * *")
 
-    def test_init_registers_three_idempotent_jobs(self):
+    def test_init_registers_four_idempotent_jobs(self):
         fake_scheduler = MagicMock()
         task_scheduler._scheduler = None
         with patch.object(task_scheduler, "AsyncIOScheduler", return_value=fake_scheduler) as constructor:
@@ -29,7 +29,7 @@ class FixedSchedulerTests(unittest.TestCase):
             task_scheduler.init_scheduler()
 
         constructor.assert_called_once_with(timezone=task_scheduler.SCHEDULER_TIMEZONE)
-        self.assertEqual(fake_scheduler.add_job.call_count, 3)
+        self.assertEqual(fake_scheduler.add_job.call_count, 4)
         ids = {call.kwargs["id"] for call in fake_scheduler.add_job.call_args_list}
         self.assertEqual(
             ids,
@@ -37,14 +37,24 @@ class FixedSchedulerTests(unittest.TestCase):
                 task_scheduler.CN_JOB_ID,
                 task_scheduler.OVERSEAS_JOB_ID,
                 task_scheduler.RETENTION_JOB_ID,
+                task_scheduler.DAILY_REPORT_JOB_ID,
             },
         )
         for call in fake_scheduler.add_job.call_args_list:
             self.assertTrue(call.kwargs["replace_existing"])
             self.assertTrue(call.kwargs["coalesce"])
             self.assertEqual(call.kwargs["max_instances"], 1)
-            self.assertEqual(call.kwargs["misfire_grace_time"], 60)
+            expected_grace = (
+                3600
+                if call.kwargs["id"] == task_scheduler.DAILY_REPORT_JOB_ID
+                else 60
+            )
+            self.assertEqual(call.kwargs["misfire_grace_time"], expected_grace)
         fake_scheduler.start.assert_called_once_with()
+
+    def test_daily_report_trigger_uses_declared_timezone(self):
+        trigger = task_scheduler._build_trigger(task_scheduler.DAILY_REPORT_CRON)
+        self.assertEqual(trigger.timezone, ZoneInfo("Asia/Shanghai"))
 
     def test_status_is_read_only_and_exposes_fixed_jobs(self):
         task_scheduler._scheduler = None
@@ -59,6 +69,28 @@ class FixedSchedulerTests(unittest.TestCase):
                 (task_scheduler.OVERSEAS_JOB_ID, "0 4,16 * * *"),
             ],
         )
+
+
+class DailyReportSchedulerTests(unittest.IsolatedAsyncioTestCase):
+    async def test_daily_report_records_aggregate_audit(self):
+        report = {
+            "report_date": "2026-08-26",
+            "status": "degraded",
+            "warnings": ["collector_candidate_observation_empty"],
+            "errors": [],
+        }
+        with patch(
+            "services.daily_report.generate_daily_report",
+            new=AsyncMock(return_value=report),
+        ), patch.object(
+            task_scheduler, "_record_auto_audit", new_callable=AsyncMock
+        ) as audit:
+            result = await task_scheduler._run_daily_report_async()
+
+        self.assertEqual(result["status"], "degraded")
+        audit.assert_awaited_once()
+        self.assertEqual(audit.await_args.args[0], "report.daily.auto")
+        self.assertEqual(audit.await_args.kwargs["resource_type"], "daily_report")
 
 
 class CollectionJobTests(unittest.IsolatedAsyncioTestCase):

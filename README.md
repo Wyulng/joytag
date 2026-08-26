@@ -68,7 +68,7 @@ flowchart LR
 | LLM | 动态种子翻译、必要的合规评估和可选推荐精排 | provider 适配层 |
 | Postgres | 审计、LLM trace、lineage、DSAR 和留存策略 | PostgreSQL 16 |
 | Keycloak | OIDC SSO、RBAC 和 TOTP | 26.7.2 |
-| Scheduler | 固定自动采集和每日留存清理 | APScheduler 3.x；Asia/Shanghai 固定时区 |
+| Scheduler | 固定自动采集、每日留存清理和日报 | APScheduler 3.x；Asia/Shanghai 固定时区 |
 
 ### 数据流
 
@@ -97,6 +97,22 @@ flowchart LR
 ~~~
 
 中文采集使用 `CN_SOURCE_MODE=taobao_suggest`。淘宝公开 suggest 接口当前不提供可直接依赖的全局热榜、分页或时间范围参数，因此系统把响应第二字段解释为“当前响应内部的相对热度”，不把它当作真实搜索量、销量或成交量。Postgres 可用时，来源响应快照、候选观察和动态种子 frontier 会持久化：淘宝来源按 `24/72/168` 小时递进刷新，Amazon 按 `6/24/72/168` 小时递进刷新，eBay 按 `24/72/168` 小时递进刷新；来源错误使用 `1/2/4/6` 小时重试。动态种子冷却为 7 天，固定种子每日轮换，已处理中文候选 30 天后才允许复检。没有 Postgres 时，来源快照和候选观察不会伪造持久缓存，动态种子 frontier 使用进程内 fallback，不影响本地开发采集。
+
+#### 每日采集与词库日报
+
+Backend 每天 `09:00`（`Asia/Shanghai`）生成只读日报，自动任务不会触发采集、Embedding、翻译或外部 LLM。报告写入服务器 `/app/reports/`，包含最近采集状态、四个 Qdrant 集合的数量/维度/来源聚合、最近 24 小时 LLM 调用统计、采集状态表计数，以及每个集合最多 10 条最新样例。报告不包含完整 prompt、LLM 原始响应、Token、密码或 API Key，并以 30 天为服务器端留存期。
+
+本机使用 SSH 主动拉取，不开放本机入站端口：
+
+```powershell
+# 立即拉取当天服务器日报
+./scripts/fetch_daily_report.ps1
+
+# 安装当前用户的 Windows 计划任务；默认 10:05（Tokyo Standard Time）拉取
+./scripts/install_daily_report_task.ps1
+```
+
+本机文件保存到 `runtime-reports/daily/`（JSON 和 Markdown），该目录属于运行时数据并被 Git 忽略。拉取脚本会校验 schema、上海日期、状态和新鲜度；失败时保留上一份有效日报。
 
 #### 推荐请求
 
@@ -300,7 +316,7 @@ Compose 还要求填写 `POSTGRES_PASSWORD`、`JOYTAG_DB_PASSWORD`、`KEYCLOAK_D
 4. 启动服务：`docker compose up -d --build`。
 5. 为 `8001` 和 `8080` 设置安全组白名单；不要把 Qdrant `6333/6334` 或 Postgres `5432` 暴露到公网。
 6. 通过 Keycloak 在 `joytag` Realm 创建首个应用用户并分配 `admin` 角色；首次登录按要求绑定 TOTP。`joytag-admin` 客户端必须保留 `joytag-admin-realm-roles` mapper，将 realm roles 写入 ID Token 的 `realm_access.roles`，Backend 据此建立管理会话。生产 redirect URI 应按实际部署域名或地址配置为 `http://<deployment-host>:8001/*`（接入 TLS 后改为 HTTPS）；本地开发回调地址保留为 `http://localhost:8000/*` 和 `http://localhost:8001/*`。不要直接复用仓库中的示例地址。
-7. 调度器启动时幂等注册固定任务：中文每日 `02:00`，海外每日 `04:00` 与 `16:00`，时区均为 `Asia/Shanghai`；合规留存清理保持每日 `03:00 UTC`。任务不会在启动时立即执行，采集重叠时跳过当前轮并记录日志、审计和 lineage；`schedules.json` 不再作为运行配置。
+7. 调度器启动时幂等注册固定任务：中文每日 `02:00`，海外每日 `04:00` 与 `16:00`，日报每日 `09:00`，时区均为 `Asia/Shanghai`；合规留存清理保持每日 `03:00 UTC`。任务不会在启动时立即执行，采集重叠时跳过当前轮并记录日志、审计和 lineage；`schedules.json` 不再作为运行配置。日报错过后最多在 1 小时内补执行，不占用采集锁，失败或降级只记录状态，不阻塞采集。
 8. 对已有的非空 Realm，不要重复执行 `--import-realm` 覆盖配置。发布后使用 master 管理员通过 Keycloak 管理 API 或 `kcadm` 幂等补齐 `joytag-admin` mapper 和生产 redirect URI：先备份客户端 JSON，按稳定 mapper 名称查询，缺失则创建、配置不一致则更新，确认只存在一个同名 mapper 后再进行 PKCE 登录验证。创建测试 operator 时补齐 Keycloak 26 用户资料字段并清空 required actions；测试完成后删除临时用户。若现有管理员密码丢失，先在隔离数据库副本验证 Keycloak 26.7.2 的 `bootstrap-admin` 恢复流程，再按维护窗口执行升级；Keycloak 数据库迁移后不能只降级镜像回滚，必须同时恢复升级前数据库备份。
 9. 配置域名和 TLS 反向代理后，将 `TLS_ENABLED=true`，再开放管理端访问。
 
@@ -330,6 +346,7 @@ Invoke-WebRequest 'http://localhost:8001/health?deep=1&llm_probe=1' `
 | `pgdata/` | 审计、LLM trace、lineage、DSAR 和留存策略 | 必须纳入加密备份 |
 | `backend/data/rules/` | 各国安全词和禁用词 | 纳入版本或配置备份 |
 | `backend/*_collection_progress.json` | 采集去重进度 | 可重建，但建议备份 |
+| `runtime-reports/` | 服务器日报和本机拉取副本 | 服务器保留 30 天，本机保留 90 天；不进入 Git |
 | `huggingface_cache` | Embedding 模型缓存 | 可重新下载，不是业务数据 |
 
 Qdrant 或 Postgres 卷丢失后，词库、审计证据和合规留痕无法仅靠源代码恢复；生产环境应把数据卷备份作为部署验收项。
@@ -392,9 +409,11 @@ backend/
     audit.py / llm_trace.py      # 审计与 LLM 留痕
     lineage.py / dsar.py         # 血缘与数据主体请求
     auth.py / retention.py       # 认证和留存策略
-    task_scheduler.py            # 固定自动采集与留存任务
+    task_scheduler.py            # 固定自动采集、留存与日报任务
+    daily_report.py              # 只读词库聚合日报与原子文件写入
   static/                        # 内嵌管理单页
   tests/                         # unittest 接口契约与回退行为测试
+scripts/                         # 本机 SSH 拉取和 Windows 日报任务安装脚本
 docs/EU_COMPLIANCE_PLAN.md       # EU 合规改造计划
 keycloak/                        # Keycloak realm 与数据库初始化脚本
 docker-compose.yml               # Qdrant、Postgres、Keycloak、Backend

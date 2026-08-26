@@ -119,6 +119,7 @@ services:
       - SESSION_SECRET=${SESSION_SECRET:?SESSION_SECRET 必填（.env，openssl rand -hex 32 生成）}
     volumes:
       - ./backend:/app
+      - ./runtime-reports:/app/reports
       - huggingface_cache:/home/appuser/.cache/huggingface/hub
     depends_on:
       qdrant:

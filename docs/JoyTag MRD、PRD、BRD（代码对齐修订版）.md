@@ -265,7 +265,7 @@ flowchart LR
 | 向量库 | Qdrant 1.9.0 | 四个集合、余弦距离、确定性 ID、payload 保存 provenance |
 | 合规数据库 | PostgreSQL 16 | audit、llm_trace、lineage、DSAR 和 retention 数据 |
 | 身份与权限 | Keycloak 26.7.2 | OIDC、RBAC、TOTP、服务间 scope 和会话 CSRF；管理客户端 ID Token 通过 realm-role mapper 携带 `realm_access.roles` |
-| 调度 | APScheduler 3.x | 固定自动采集和每日留存清理；不读取动态 Cron 配置 |
+| 调度 | APScheduler 3.x | 固定自动采集、每日留存清理和 09:00 日报；不读取动态 Cron 配置 |
 
 ### 3.3.3 数据采集与语义处理流程
 
@@ -282,6 +282,8 @@ flowchart LR
     -> 有锚点：规则优先，规则未覆盖时 LLM 合规评估
     -> local_tags / pending_review / blocked_decisions
 ```
+
+**运行日报**：Backend 每日 09:00（`Asia/Shanghai`）只读汇总最近采集状态、lineage、四个 Qdrant 集合、采集状态表和最近 24 小时 LLM 调用，并在服务器 `/app/reports/` 原子写入 JSON/Markdown。日报不调用采集器、Embedding、翻译或外部 LLM；本机通过 SSH 拉取，不开放入站端口。样例每个集合最多 10 条，生产报告不保存 prompt、LLM 原始响应或凭据。
 
 该流程中的每条词都保留 `source_type`、`collection_run_id`、`collected_at` 等来源信息。LLM 参与动态种子翻译、有锚点且规则未覆盖词的合规评估，以及可选推荐精排；最终写入推荐池的标签必须来自已入库的结构化词条，不允许由 LLM 直接生成未入库词。
 

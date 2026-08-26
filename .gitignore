@@ -19,6 +19,10 @@ pgdata/
 # Runtime state files (2026-08 合规改造新增)
 backend/cn_collection_progress.json
 backend/overseas_collection_progress.json
+# Daily aggregate reports (server bind mount and local SSH pulls)
+/runtime-reports/
+backend/data/reports/
+/deploy-backups/
 # LLM 动态种子翻译缓存（运行时增量生成，可重建）
 backend/data/translation_cache.json
 
