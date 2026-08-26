@@ -160,7 +160,7 @@ Keycloak :8080（对外但安全组限办公 IP；realm 导入；MFA TOTP 强制
 
 **backend/services/logging_config.py**：JSONFormatter 加脱敏 patterns；导出 `sanitize_for_log()`。
 
-**backend/services/task_scheduler.py**：使用 `Asia/Shanghai` 显式时区固定注册中文采集（每日 02:00）和海外采集（每日 04:00、16:00），并注册 `compliance_retention`（每日 03:00 UTC）；任务幂等、单实例、合并错过触发，采集重叠时跳过并记录。已删除动态 Cron、`schedules.json` 和人工采集接口；`/admin/api/collection/status` 只读返回下一次运行时间和最近状态。
+**backend/services/task_scheduler.py**：使用 `Asia/Shanghai` 显式时区固定注册中文采集（每日 02:00）、海外采集（每日 04:00、16:00）和日报（每日 09:00），并注册 `compliance_retention`（每日 03:00 UTC）；任务幂等、单实例、合并错过触发，采集重叠时跳过并记录。日报只读汇总 Qdrant/Postgres，不触发采集或 LLM，错过后最多 1 小时内补执行，且不占用采集锁。已删除动态 Cron、`schedules.json` 和人工采集接口；`/admin/api/collection/status` 只读返回下一次运行时间和最近状态。
 
 **backend/web_ui.py + static/**：新页面 transparency/audit/dsar；页面路由加 `require_admin_session` 未登录 302；admin.js 加 credentials/CSRF 头/401 跳登录；pending.html 拒绝必填理由。
 
