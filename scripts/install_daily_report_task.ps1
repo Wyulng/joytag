@@ -26,7 +26,7 @@ $action = New-ScheduledTaskAction `
 $trigger = New-ScheduledTaskTrigger -Daily -At $time
 $principal = New-ScheduledTaskPrincipal `
     -UserId ("{0}\{1}" -f $env:USERDOMAIN, $env:USERNAME) `
-    -LogonType InteractiveToken `
+    -LogonType Interactive `
     -RunLevel Limited
 
 Register-ScheduledTask `
