@@ -1,5 +1,6 @@
 version: "2.4"
-# ⚠️ 服务器 docker-compose v1.29.2：保持 v2.4 语法兼容（短格式 depends_on / 无顶层 name）
+# ⚠️ 服务器仍使用 docker-compose v1.29.2 + Docker 29：保持 v2.4 语法兼容。
+# 该组合不要使用 down 或 --force-recreate；现有服务变更由 joytag-deploy 按单服务安全重建处理。
 # 2026-08 EU 合规改造：端口全部改绑 127.0.0.1（除 Keycloak 8080，浏览器需直连——安全组限办公 IP）
 services:
   qdrant:

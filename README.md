@@ -147,7 +147,7 @@ Backend 每天 `09:00`（`Asia/Shanghai`）生成只读日报，自动任务不�
 ### 前置条件
 
 - Windows PowerShell 或兼容的 PowerShell 环境
-- Docker Desktop / Docker Engine 与 Compose
+- Docker Desktop / Docker Engine 与 Docker Compose v2（命令为 `docker compose`，不是旧版 `docker-compose`）
 - 本地开发需要 Python 3.11 和 [uv](https://docs.astral.sh/uv/)
 - 完整采集与合规评估需要可用的 LLM API Key；默认向量推荐本身不依赖 LLM。Qdrant 密钥必须显式配置
 
@@ -162,6 +162,8 @@ Copy-Item .env.example .env
 ./backend/setup_dev.ps1
 ./dev.ps1
 ~~~
+
+`dev.ps1` 会先检查 Compose v2。不要为了兼容服务器而在本机改用 `docker-compose` 1.x；旧版客户端在较新的 Docker Engine 上重建带挂载的服务时可能触发 `KeyError: ContainerConfig`。
 
 首次安装脚本会创建 Python 3.11 虚拟环境、安装 `backend/requirements.txt`，并通过 ModelScope 下载约 650 MB 的 GTE 多语言 Embedding 模型到 `backend/models/gte-multilingual-base/`。模型权重目录被忽略；`backend/models/__init__.py` 与 `backend/models/schemas.py` 是启动必需的运行时 API 契约源码，必须纳入 Git。GTE 使用 `trust_remote_code` 加载，首次启动和 CPU 推理的内存开销会明显高于旧版 BGE。
 
@@ -310,15 +312,23 @@ Compose 还要求填写 `POSTGRES_PASSWORD`、`JOYTAG_DB_PASSWORD`、`KEYCLOAK_D
 
 ## 生产部署
 
-1. 准备一台至少约 6 GB 内存的服务器，安装 Docker Compose。
+1. 准备一台至少约 6 GB 内存的服务器，安装 Docker Compose；本机开发使用 Compose v2，当前生产机仍由部署技能兼容 `docker-compose` 1.29.2。
 2. 复制 `.env.example` 为 `.env`，生成并填写所有基础设施密钥、LLM 配置和 `OIDC_ISSUER`。
 3. 将 GTE 模型权重单独准备到 `backend/models/gte-multilingual-base/`，或通过 `EMBEDDING_MODEL_PATH` 指定已挂载的模型目录；模型权重不随 Git 发布。
-4. 启动服务：`docker compose up -d --build`。
+4. 新环境可用 `docker compose up -d --build` 启动服务；已有生产服务器必须使用 `joytag-deploy`，不要直接对旧版 `docker-compose` 执行全栈重建。
 5. 为 `8001` 和 `8080` 设置安全组白名单；不要把 Qdrant `6333/6334` 或 Postgres `5432` 暴露到公网。
 6. 通过 Keycloak 在 `joytag` Realm 创建首个应用用户并分配 `admin` 角色；首次登录按要求绑定 TOTP。`joytag-admin` 客户端必须保留 `joytag-admin-realm-roles` mapper，将 realm roles 写入 ID Token 的 `realm_access.roles`，Backend 据此建立管理会话。生产 redirect URI 应按实际部署域名或地址配置为 `http://<deployment-host>:8001/*`（接入 TLS 后改为 HTTPS）；本地开发回调地址保留为 `http://localhost:8000/*` 和 `http://localhost:8001/*`。不要直接复用仓库中的示例地址。
 7. 调度器启动时幂等注册固定任务：中文每日 `02:00`，海外每日 `04:00` 与 `16:00`，日报每日 `09:00`，时区均为 `Asia/Shanghai`；合规留存清理保持每日 `03:00 UTC`。任务不会在启动时立即执行，采集重叠时跳过当前轮并记录日志、审计和 lineage；`schedules.json` 不再作为运行配置。日报错过后最多在 1 小时内补执行，不占用采集锁，失败或降级只记录状态，不阻塞采集。
 8. 对已有的非空 Realm，不要重复执行 `--import-realm` 覆盖配置。发布后使用 master 管理员通过 Keycloak 管理 API 或 `kcadm` 幂等补齐 `joytag-admin` mapper 和生产 redirect URI：先备份客户端 JSON，按稳定 mapper 名称查询，缺失则创建、配置不一致则更新，确认只存在一个同名 mapper 后再进行 PKCE 登录验证。创建测试 operator 时补齐 Keycloak 26 用户资料字段并清空 required actions；测试完成后删除临时用户。若现有管理员密码丢失，先在隔离数据库副本验证 Keycloak 26.7.2 的 `bootstrap-admin` 恢复流程，再按维护窗口执行升级；Keycloak 数据库迁移后不能只降级镜像回滚，必须同时恢复升级前数据库备份。
 9. 配置域名和 TLS 反向代理后，将 `TLS_ENABLED=true`，再开放管理端访问。
+
+### Compose `ContainerConfig` 兼容性
+
+当前生产机为 Docker 29.1.3 + `docker-compose` 1.29.2。该旧客户端在检测到服务配置或 bind mount 变化、进入 convergence recreate 路径时，会读取 Docker Engine 已不再提供的镜像 `ContainerConfig` 字段，从而报 `KeyError: 'ContainerConfig'`。这不是 Qdrant、PostgreSQL、模型或业务数据损坏，也不应通过删除数据目录解决。
+
+生产部署必须使用 `joytag-deploy` 技能：它优先使用 Compose v2；检测到旧 Compose 时，会先备份并校验目标服务，只移除匹配的旧 Backend 容器，再执行 `docker-compose up -d --no-build backend` 让 Compose 创建新容器。脚本使用失败即停，不会在重建失败后继续执行 `docker exec` 或健康等待；同时保护 `qdrant_storage` 和 `pgdata` 挂载。不要执行全栈 `docker-compose down`、`--force-recreate`、`docker system prune` 或批量 `docker rm`。如果未来服务器安装 Compose v2，部署脚本会自动切换到现代客户端。
+
+代码未改变但仅需重启 Backend 时也应通过部署技能执行；如果 Compose 文件、挂载、镜像或依赖发生变化，必须走上述单服务安全重建流程，不能手工复用旧的 convergence recreate 命令。
 
 应用管理员密码属于运行时机密，不提交 Git，也不通过聊天传递。服务器恢复或轮换时，将其保存到权限为 `600` 的 `deploy-backups/<timestamp>/app-admin.credentials`；Keycloak master 管理员密码仍只保存在服务器 `.env`，两者不可混用。具体服务器绝对路径仅保存在本地忽略的 `AGENTS.md` 运维记忆中。
 
