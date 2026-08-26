@@ -10,7 +10,7 @@
 > | P1 | recommend 响应 provenance（source/compliance_reason/anchor_cn_word/trend_score/ai_generated + ai_assisted/parameters_version/disclosure_url）、`/v1/disclosure/parameters`（DSA Art.27 机器可读，公开）、审计查看页 + hash-chain 校验按钮、blocked 列表页、规则页 rule_id/added_by 显示 | ✅ 完成 |
 > | P2 | dsar.py + 端点（`/v1/dsar/request` 公开 5/hour + `/admin/api/dsar/*` 检索/擦除）+ DSAR 管理页、retention.py + `compliance_retention` 每日 03:00 UTC 系统任务 + 配置/手动触发端点、`/transparency` 公开透明度页（Art.14(5)(b) + DSA 摘要 + AI Act 声明 + DSAR 表单） | ✅ 完成（代码） |
 > | LLM 降本一期 | 默认本地向量推荐、无锚点本地规则门控、业务 LLM 最多重试一次与输出上限、健康检查显式授权探测、规则词保守归一化 | ✅ 完成（代码） |
-> | 部署验证 | 服务器 `docker-compose down && up -d --build`、Keycloak 首用户 kcadm 引导、安全组收紧、curl 验证清单（见第十节） | ⏳ 待执行（部署时） |
+> | 部署验证 | 使用 `joytag-deploy` 的分阶段启动与单服务安全重建、Keycloak 首用户 kcadm 引导、安全组收紧、curl 验证清单（见第十节） | ⏳ 待执行（部署时） |
 > | TLS | 域名就绪后 Caddy TLS + `TLS_ENABLED=true`（Let's Encrypt 不签发裸 IP） | ⏳ 待域名 |
 
 ## 一、背景与目标
@@ -195,7 +195,7 @@ Keycloak :8080（对外但安全组限办公 IP；realm 导入；MFA TOTP 强制
 ## 九、验证方案
 
 1. 每阶段 `python -m compileall backend`
-2. 服务器 `docker-compose down && docker-compose up -d --build`，确认 `[db] schema ready`、`compliance_retention` 注册
+2. 服务器使用 `joytag-deploy` 分阶段启动：Qdrant/Postgres → Keycloak → Backend。生产机的 Docker 29 + `docker-compose` 1.29.2 不执行全栈 `down` 或 `--force-recreate`；若 Compose 配置/挂载变化，由部署脚本备份并校验后只移除受影响的服务容器，再以 `up --no-build` 创建。确认 `[db] schema ready`、`compliance_retention` 注册
 3. `/admin` → Keycloak 登录 → TOTP → 回跳；cookie HttpOnly 确认
 4. 带会话无 CSRF 头的 POST → 403
 5. UI 通过一条 pending → 审计表出现记录（含操作者）；verify ok；篡改一行后 verify 报 mismatch
@@ -204,7 +204,7 @@ Keycloak :8080（对外但安全组限办公 IP；realm 导入；MFA TOTP 强制
 8. **Provider 与健康检查测试**：`/health` 和 `deep=1` 不请求模型；错误或缺失探测密钥不请求模型；正确密钥恰好探测一次；可选 `RECOMMEND_RERANK_MODE=llm` 下切换 `LLM_BASE_URL` 后零代码改动跑通或安全回退 recommend
 9. `POST /admin/api/retention/run` 返回清理计数
 10. 采集含 "eco friendly fashion" → 出现在 blocked 且理由引用 `ucpd_env_generic`
-11. 服务器 `docker-compose config -q` 静默通过（v1.29.2）
+11. 服务器 Compose 配置校验静默通过；当前 v1.29.2 仅用于解析配置，服务重建遵循 ContainerConfig 兼容保护，不直接进入旧客户端 convergence recreate 路径
 
 ## 十、风险与前置条件
 
@@ -214,6 +214,7 @@ Keycloak :8080（对外但安全组限办公 IP；realm 导入；MFA TOTP 强制
 - **R4 Presidio 中文误报**：regex-only 保守模式 + 型号 token 白名单；P0 后观察。
 - **R5 审计失败=500**：可责性优先；healthcheck 检查 DB/向量服务，LLM 外部探测必须显式授权且不作为普通健康状态的依赖。
 - **R6 blocked_decisions**：惰性创建无迁移。
+- **R7 Compose 兼容性**：生产机 Docker 29.1.3 与 `docker-compose` 1.29.2 在服务重建时可能因缺失 `ContainerConfig` 失败。本机强制使用 Compose v2；生产部署由 `joytag-deploy` 检测客户端版本，旧版只按服务校验挂载后移除并重新创建目标容器，严禁全栈 `down`、`--force-recreate` 和数据目录清理。
 - **待确认**：办公 IP 白名单维护流程。
 
 ## 参考来源（法规调研）
