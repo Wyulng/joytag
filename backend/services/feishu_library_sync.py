@@ -291,7 +291,13 @@ async def _request_json(
                 status_code=status_code,
                 api_code=numeric_code,
             )
-        data = payload.get("data") or {}
+        data = payload.get("data")
+        if data is None:
+            # The tenant-access-token endpoint returns its token at the
+            # envelope root, while Docx endpoints place response fields in
+            # ``data``.  Preserve root-level fields for the former and keep
+            # the existing empty-data behavior for successful write calls.
+            return payload
         if not isinstance(data, dict):
             raise FeishuSyncError("Feishu API returned invalid data")
         return data

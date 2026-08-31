@@ -52,6 +52,15 @@ def _response(data: dict, status_code: int = 200) -> httpx.Response:
     )
 
 
+def _token_response(token: str = "tenant-token") -> httpx.Response:
+    request = httpx.Request("POST", "https://open.feishu.cn/test")
+    return httpx.Response(
+        200,
+        request=request,
+        json={"code": 0, "msg": "ok", "tenant_access_token": token, "expire": 7200},
+    )
+
+
 def _blocks(source_text: str, count_text: str) -> list[dict]:
     def text_block(block_id: str, text: str) -> dict:
         return {
@@ -155,6 +164,21 @@ class FeishuBlockTests(unittest.TestCase):
 
 
 class FeishuRequestTests(unittest.IsolatedAsyncioTestCase):
+    async def test_tenant_token_root_level_response_is_read(self):
+        config = sync.FeishuSyncConfig(
+            enabled=True,
+            app_id="cli_test_app",
+            app_secret="test-secret-value",
+            document_id="doc",
+            report_path=Path("latest.json"),
+            state_path=Path("state.json"),
+        )
+        client = FakeAsyncClient([_token_response()])
+
+        token = await sync._get_tenant_access_token(client, config)
+
+        self.assertEqual(token, "tenant-token")
+
     async def test_transient_http_errors_retry_up_to_success(self):
         client = FakeAsyncClient([_response({}, 429), _response({}, 503), _response({})])
         with patch("services.feishu_library_sync.asyncio.sleep", new=AsyncMock()) as sleep:
@@ -203,7 +227,7 @@ class FeishuSynchronizationTests(unittest.IsolatedAsyncioTestCase):
         new_blocks = _blocks(snapshot.source_line, snapshot.count_line)
         client = FakeAsyncClient(
             [
-                _response({"tenant_access_token": "tenant-token"}),
+                _token_response(),
                 _response({"items": old_blocks, "has_more": False}),
                 _response({}),
                 _response({"items": new_blocks, "has_more": False}),
@@ -249,7 +273,7 @@ class FeishuSynchronizationTests(unittest.IsolatedAsyncioTestCase):
         snapshot = sync.build_library_snapshot(report, now=self.now)
         client = FakeAsyncClient(
             [
-                _response({"tenant_access_token": "tenant-token"}),
+                _token_response(),
                 _response(
                     {"items": _blocks(snapshot.source_line, snapshot.count_line), "has_more": False}
                 ),
@@ -271,7 +295,7 @@ class FeishuSynchronizationTests(unittest.IsolatedAsyncioTestCase):
         old_blocks = _blocks("数据来源：服务器每日词库日报｜更新时间：—｜状态：等待首次同步", "中文锚点：—｜可复用标签：—｜待审核：—｜拦截决策：—")
         client = FakeAsyncClient(
             [
-                _response({"tenant_access_token": "tenant-token"}),
+                _token_response(),
                 _response({"items": old_blocks, "has_more": False}),
                 _response({}, 409),
                 _response({"items": old_blocks, "has_more": False}),
