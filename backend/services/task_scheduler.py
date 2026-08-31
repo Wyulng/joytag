@@ -33,6 +33,8 @@ OVERSEAS_CRON = "0 4,16 * * *"
 RETENTION_JOB_ID = "compliance_retention"
 DAILY_REPORT_JOB_ID = "daily_collection_report"
 DAILY_REPORT_CRON = "0 9 * * *"
+FEISHU_SYNC_JOB_ID = "feishu_library_snapshot"
+FEISHU_SYNC_CRON = "10 9 * * *"
 
 _JOB_OPTIONS = {
     "replace_existing": True,
@@ -287,6 +289,60 @@ async def _run_daily_report_async() -> dict[str, Any]:
     return {"status": status, "report_date": safe_detail["report_date"]}
 
 
+async def _run_feishu_sync_async() -> dict[str, Any]:
+    """Write the current server report to the configured Feishu document."""
+    from services.feishu_library_sync import sync_latest_report_to_doc
+
+    report_date = datetime.now(SCHEDULER_TIMEZONE).date().isoformat()
+    resource_id = f"feishu-snapshot:{report_date}"
+    try:
+        result = await sync_latest_report_to_doc()
+    except Exception as exc:
+        error_type = type(exc).__name__
+        logger.error(
+            "[feishu_snapshot_failed] report_date=%s error_type=%s",
+            report_date,
+            error_type,
+        )
+        await _record_auto_audit(
+            "report.feishu.auto",
+            resource_id,
+            status="failed",
+            resource_type="feishu_snapshot",
+            detail={"report_date": report_date, "error_type": error_type},
+        )
+        return {"status": "failed", "report_date": report_date}
+
+    status = str(result.get("status", "unknown")) if isinstance(result, dict) else "unknown"
+    result_report_date = (
+        result.get("report_date", report_date)
+        if isinstance(result, dict)
+        else report_date
+    )
+    changed = bool(result.get("changed", False)) if isinstance(result, dict) else False
+    logger.info(
+        "[feishu_snapshot_completed] report_date=%s status=%s changed=%s",
+        result_report_date,
+        status,
+        changed,
+    )
+    await _record_auto_audit(
+        "report.feishu.auto",
+        resource_id,
+        status=status,
+        resource_type="feishu_snapshot",
+        detail={
+            "report_date": result_report_date,
+            "changed": changed,
+        },
+    )
+    return {
+        "status": status,
+        "report_date": result_report_date,
+        "changed": changed,
+    }
+
+
 def _add_fixed_job(func: Callable, *, job_id: str, cron: str, timezone_value: ZoneInfo) -> None:
     assert _scheduler is not None
     _scheduler.add_job(
@@ -328,11 +384,23 @@ def init_scheduler() -> None:
         id=DAILY_REPORT_JOB_ID,
         **_REPORT_JOB_OPTIONS,
     )
+    _scheduler.add_job(
+        _run_feishu_sync_async,
+        _build_trigger(FEISHU_SYNC_CRON, SCHEDULER_TIMEZONE),
+        id=FEISHU_SYNC_JOB_ID,
+        **_REPORT_JOB_OPTIONS,
+    )
     _scheduler.start()
     logger.info(
         "[scheduler_started] timezone=%s jobs=%s",
         SCHEDULER_TIMEZONE_NAME,
-        [CN_JOB_ID, OVERSEAS_JOB_ID, RETENTION_JOB_ID, DAILY_REPORT_JOB_ID],
+        [
+            CN_JOB_ID,
+            OVERSEAS_JOB_ID,
+            RETENTION_JOB_ID,
+            DAILY_REPORT_JOB_ID,
+            FEISHU_SYNC_JOB_ID,
+        ],
     )
 
 

@@ -114,6 +114,8 @@ Backend 每天 `09:00`（`Asia/Shanghai`）生成只读日报，自动任务不�
 
 本机文件保存到 `runtime-reports/daily/`（JSON 和 Markdown），该目录属于运行时数据并被 Git 忽略。拉取脚本会校验 schema、上海日期、状态和新鲜度；失败时保留上一份有效日报。
 
+服务器可在生成日报后自动更新商业计划书中的“当前词库运行快照”。当 `FEISHU_SYNC_ENABLED=true` 且配置了企业自建应用凭据和目标文档 ID 时，Backend 每天 `09:10`（`Asia/Shanghai`）读取 `/app/reports/latest.json`，更新摘要下方的四项词库数量、日报时间和状态。同步任务只使用日报文件，并将结果保存到 `/app/reports/feishu-sync-state.json`；本机日报拉取与服务器写回分别运行。
+
 #### 推荐请求
 
 ~~~text
@@ -300,6 +302,9 @@ curl -X POST http://localhost:8001/v1/tag/recommend \
 | `ANCHOR_MATCH_THRESHOLD` / `ANCHOR_MATCH_UNCATEGORIZED_THRESHOLD` | 海外词到中文锚点的匹配阈值 | 默认 `0.60` / `0.75`；阈值必须在 0-1 之间 |
 | `CN_SOURCE_MODE` | 中文采集来源 | 默认 `taobao_suggest`；官方关键词推荐接口只作为后续 shadow 对比，不自动切换 |
 | `DATABASE_URL` | 合规数据库 | Compose 自动注入容器内地址 |
+| `FEISHU_SYNC_ENABLED` | 服务器词库快照写回开关 | 默认 `false`；启用后每天 `09:10` 更新配置的飞书文档 |
+| `FEISHU_APP_ID` / `FEISHU_APP_SECRET` | 飞书企业自建应用凭据 | 服务器 `.env` 配置，应用需具备目标文档编辑权限 |
+| `FEISHU_DOCUMENT_ID` | 词库快照目标文档 | 填写飞书 Docx 文档 ID |
 | `AUTH_ENABLED` | 管理端认证 | 本地开发为 `false`；生产必须为 `true` |
 | `OIDC_ISSUER` / `OIDC_JWKS_URL` / `OIDC_TOKEN_URL` | Keycloak OIDC | 外部 issuer 与容器内 token/JWKS 地址可分开配置 |
 | `SESSION_SECRET` | 会话签名 | 认证开启时必填，建议使用 `openssl rand -hex 32` 生成 |
@@ -318,9 +323,10 @@ Compose 还要求填写 `POSTGRES_PASSWORD`、`JOYTAG_DB_PASSWORD`、`KEYCLOAK_D
 4. 新环境可用 `docker compose up -d --build` 启动服务；已有生产服务器必须使用 `joytag-deploy`，不要直接对旧版 `docker-compose` 执行全栈重建。
 5. 为 `8001` 和 `8080` 设置安全组白名单；不要把 Qdrant `6333/6334` 或 Postgres `5432` 暴露到公网。
 6. 通过 Keycloak 在 `joytag` Realm 创建首个应用用户并分配 `admin` 角色；首次登录按要求绑定 TOTP。`joytag-admin` 客户端必须保留 `joytag-admin-realm-roles` mapper，将 realm roles 写入 ID Token 的 `realm_access.roles`，Backend 据此建立管理会话。生产 redirect URI 应按实际部署域名或地址配置为 `http://<deployment-host>:8001/*`（接入 TLS 后改为 HTTPS）；本地开发回调地址保留为 `http://localhost:8000/*` 和 `http://localhost:8001/*`。不要直接复用仓库中的示例地址。
-7. 调度器启动时幂等注册固定任务：中文每日 `02:00`，海外每日 `04:00` 与 `16:00`，日报每日 `09:00`，时区均为 `Asia/Shanghai`；合规留存清理保持每日 `03:00 UTC`。任务不会在启动时立即执行，采集重叠时跳过当前轮并记录日志、审计和 lineage；`schedules.json` 不再作为运行配置。日报错过后最多在 1 小时内补执行，不占用采集锁，失败或降级只记录状态，不阻塞采集。
-8. 对已有的非空 Realm，不要重复执行 `--import-realm` 覆盖配置。发布后使用 master 管理员通过 Keycloak 管理 API 或 `kcadm` 幂等补齐 `joytag-admin` mapper 和生产 redirect URI：先备份客户端 JSON，按稳定 mapper 名称查询，缺失则创建、配置不一致则更新，确认只存在一个同名 mapper 后再进行 PKCE 登录验证。创建测试 operator 时补齐 Keycloak 26 用户资料字段并清空 required actions；测试完成后删除临时用户。若现有管理员密码丢失，先在隔离数据库副本验证 Keycloak 26.7.2 的 `bootstrap-admin` 恢复流程，再按维护窗口执行升级；Keycloak 数据库迁移后不能只降级镜像回滚，必须同时恢复升级前数据库备份。
-9. 配置域名和 TLS 反向代理后，将 `TLS_ENABLED=true`，再开放管理端访问。
+7. 启用飞书词库快照写回时，在企业自建应用中发布可用版本，开通 `docx:document` 编辑权限，并将目标商业计划书授权给应用或应用机器人；在服务器 `.env` 填写 `FEISHU_SYNC_ENABLED=true`、`FEISHU_APP_ID`、`FEISHU_APP_SECRET` 和 `FEISHU_DOCUMENT_ID`。凭据只保存在服务器运行环境。
+8. 调度器启动时幂等注册固定任务：中文每日 `02:00`，海外每日 `04:00` 与 `16:00`，合规留存清理每日 `03:00 UTC`，日报每日 `09:00`，飞书词库快照写回每日 `09:10`，时区均为 `Asia/Shanghai`（留存清理使用 UTC）。任务按固定时间运行，采集重叠时跳过当前轮并记录日志、审计和 lineage；`schedules.json` 不再作为运行配置。日报与飞书写回错过后最多在 1 小时内补执行，飞书写回读取日报文件并记录同步状态。
+9. 对已有的非空 Realm，不要重复执行 `--import-realm` 覆盖配置。发布后使用 master 管理员通过 Keycloak 管理 API 或 `kcadm` 幂等补齐 `joytag-admin` mapper 和生产 redirect URI：先备份客户端 JSON，按稳定 mapper 名称查询，缺失则创建、配置不一致则更新，确认只存在一个同名 mapper 后再进行 PKCE 登录验证。创建测试 operator 时补齐 Keycloak 26 用户资料字段并清空 required actions；测试完成后删除临时用户。若现有管理员密码丢失，先在隔离数据库副本验证 Keycloak 26.7.2 的 `bootstrap-admin` 恢复流程，再按维护窗口执行升级；Keycloak 数据库迁移后不能只降级镜像回滚，必须同时恢复升级前数据库备份。
+10. 配置域名和 TLS 反向代理后，将 `TLS_ENABLED=true`，再开放管理端访问。
 
 ### Compose `ContainerConfig` 兼容性
 
@@ -419,8 +425,9 @@ backend/
     audit.py / llm_trace.py      # 审计与 LLM 留痕
     lineage.py / dsar.py         # 血缘与数据主体请求
     auth.py / retention.py       # 认证和留存策略
-    task_scheduler.py            # 固定自动采集、留存与日报任务
+    task_scheduler.py            # 固定自动采集、留存、日报与飞书写回任务
     daily_report.py              # 只读词库聚合日报与原子文件写入
+    feishu_library_sync.py       # 服务器端词库日报快照写回飞书
   static/                        # 内嵌管理单页
   tests/                         # unittest 接口契约与回退行为测试
 scripts/                         # 本机 SSH 拉取和 Windows 日报任务安装脚本
