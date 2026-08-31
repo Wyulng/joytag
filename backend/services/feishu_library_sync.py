@@ -2,8 +2,8 @@
 
 The sync consumes the aggregate ``latest.json`` report produced by
 ``daily_report``.  It does not read Qdrant, run collectors, invoke models, or
-change the report schema.  Only two pre-created text blocks in the target
-document are updated.
+change the report schema.  The target document can expose the snapshot as a
+structured table; older documents with two text blocks remain supported.
 """
 
 from __future__ import annotations
@@ -41,6 +41,16 @@ MIN_REPORT_AGE = timedelta(hours=-1)
 SNAPSHOT_HEADING = "当前词库运行快照"
 SOURCE_LINE_PREFIX = "数据来源：服务器每日词库日报"
 COUNT_LINE_PREFIX = "中文锚点："
+SNAPSHOT_TABLE_HEADERS = ("指标", "当前值")
+SNAPSHOT_TABLE_LABELS = (
+    "数据来源",
+    "更新时间",
+    "状态",
+    "中文锚点",
+    "可复用标签",
+    "待审核",
+    "拦截决策",
+)
 
 FEISHU_REQUEST_TIMEOUT = 20.0
 MAX_HTTP_ATTEMPTS = 3
@@ -120,15 +130,18 @@ class LibrarySnapshot:
     status: str
     source_line: str
     count_line: str
+    table_values: tuple[str, ...]
     content_sha256: str
 
 
 @dataclass(frozen=True)
 class SnapshotTarget:
-    source_block_id: str
-    count_block_id: str
+    source_block_id: str | None
+    count_block_id: str | None
     source_text: str
     count_text: str
+    table_value_block_ids: tuple[str, ...] = ()
+    table_value_texts: tuple[str, ...] = ()
 
 
 def _env_true(name: str) -> bool:
@@ -203,6 +216,15 @@ def build_library_snapshot(
         f"待审核：{counts['pending_review']:,}｜"
         f"拦截决策：{counts['blocked_decisions']:,}"
     )
+    table_values = (
+        "服务器每日词库日报",
+        f"{generated_text}（{REPORT_TIMEZONE_NAME}）",
+        status_label,
+        f"{counts['cn_anchors']:,}",
+        f"{counts['local_tags']:,}",
+        f"{counts['pending_review']:,}",
+        f"{counts['blocked_decisions']:,}",
+    )
     content_sha256 = hashlib.sha256(
         f"{source_line}\n{count_line}".encode("utf-8")
     ).hexdigest()
@@ -212,6 +234,7 @@ def build_library_snapshot(
         status=str(status),
         source_line=source_line,
         count_line=count_line,
+        table_values=table_values,
         content_sha256=content_sha256,
     )
 
@@ -386,6 +409,103 @@ def _block_text(block: dict[str, Any]) -> str:
     return "".join(parts)
 
 
+def _table_cell_text(
+    cell_id: str, blocks_by_id: dict[str, dict[str, Any]], table_id: str
+) -> tuple[str, str]:
+    """Return one table cell's text and its editable text-block ID."""
+    cell = blocks_by_id.get(cell_id)
+    if not isinstance(cell, dict) or cell.get("block_type") != 32:
+        raise FeishuSyncError("snapshot table cell is missing")
+    if cell.get("parent_id") != table_id:
+        raise FeishuSyncError("snapshot table cell parent is invalid")
+    children = cell.get("children")
+    if not isinstance(children, list) or len(children) != 1:
+        raise FeishuSyncError("snapshot table cell structure is invalid")
+    text_block_id = children[0]
+    if not isinstance(text_block_id, str):
+        raise FeishuSyncError("snapshot table text block ID is invalid")
+    text_block = blocks_by_id.get(text_block_id)
+    if not isinstance(text_block, dict) or text_block.get("block_type") != 2:
+        raise FeishuSyncError("snapshot table text block is invalid")
+    text = _block_text(text_block)
+    if not text:
+        raise FeishuSyncError("snapshot table cell text is empty")
+    return text, text_block_id
+
+
+def _find_snapshot_table_target(
+    blocks: list[dict[str, Any]], heading_index: int, parent_id: str
+) -> SnapshotTarget | None:
+    """Locate the structured snapshot table immediately after its heading."""
+    if heading_index + 1 >= len(blocks):
+        return None
+    table_block = blocks[heading_index + 1]
+    if (
+        table_block.get("parent_id") != parent_id
+        or table_block.get("block_type") != 31
+    ):
+        return None
+    table_id = table_block.get("block_id")
+    table = table_block.get("table")
+    if not isinstance(table_id, str) or not isinstance(table, dict):
+        raise FeishuSyncError("snapshot table metadata is missing")
+    properties = table.get("property")
+    cells = table.get("cells")
+    if not isinstance(properties, dict) or not isinstance(cells, list):
+        raise FeishuSyncError("snapshot table definition is invalid")
+    column_size = properties.get("column_size")
+    row_size = properties.get("row_size")
+    if column_size != 2 or not isinstance(row_size, int) or row_size != 8:
+        raise FeishuSyncError("snapshot table dimensions are invalid")
+    if len(cells) != column_size * row_size or any(
+        not isinstance(cell_id, str) for cell_id in cells
+    ):
+        raise FeishuSyncError("snapshot table cells are invalid")
+
+    blocks_by_id = {
+        block.get("block_id"): block
+        for block in blocks
+        if isinstance(block.get("block_id"), str)
+    }
+    cell_values: list[str] = []
+    text_block_ids: list[str] = []
+    for cell_id in cells:
+        value, text_block_id = _table_cell_text(cell_id, blocks_by_id, table_id)
+        cell_values.append(value)
+        text_block_ids.append(text_block_id)
+
+    if tuple(cell_values[:2]) != SNAPSHOT_TABLE_HEADERS:
+        raise FeishuSyncError("snapshot table headers are invalid")
+    label_to_value_index: dict[str, int] = {}
+    for row in range(1, row_size):
+        label_index = row * column_size
+        label = cell_values[label_index]
+        if label in label_to_value_index:
+            raise FeishuSyncError("snapshot table labels are duplicated")
+        label_to_value_index[label] = label_index + 1
+    if set(label_to_value_index) != set(SNAPSHOT_TABLE_LABELS):
+        raise FeishuSyncError("snapshot table labels are invalid")
+
+    value_indices = tuple(label_to_value_index[label] for label in SNAPSHOT_TABLE_LABELS)
+    table_values = tuple(cell_values[index] for index in value_indices)
+    source_text = (
+        f"数据来源：{table_values[0]}｜更新时间：{table_values[1]}｜"
+        f"状态：{table_values[2]}"
+    )
+    count_text = (
+        f"中文锚点：{table_values[3]}｜可复用标签：{table_values[4]}｜"
+        f"待审核：{table_values[5]}｜拦截决策：{table_values[6]}"
+    )
+    return SnapshotTarget(
+        source_block_id=None,
+        count_block_id=None,
+        source_text=source_text,
+        count_text=count_text,
+        table_value_block_ids=tuple(text_block_ids[index] for index in value_indices),
+        table_value_texts=table_values,
+    )
+
+
 def find_snapshot_target(blocks: list[dict[str, Any]]) -> SnapshotTarget:
     headings = [
         (index, block)
@@ -399,6 +519,11 @@ def find_snapshot_target(blocks: list[dict[str, Any]]) -> SnapshotTarget:
 
     heading_index, heading = headings[0]
     parent_id = heading.get("parent_id")
+    if not isinstance(parent_id, str):
+        raise FeishuSyncError("snapshot heading parent is missing")
+    table_target = _find_snapshot_table_target(blocks, heading_index, parent_id)
+    if table_target is not None:
+        return table_target
     if heading_index + 2 >= len(blocks):
         raise FeishuSyncError("snapshot dynamic blocks are missing")
     source_block = blocks[heading_index + 1]
@@ -437,20 +562,35 @@ async def _update_snapshot_blocks(
     target: SnapshotTarget,
     snapshot: LibrarySnapshot,
 ) -> None:
-    requests = [
-        {
-            "block_id": target.source_block_id,
-            "update_text_elements": {
-                "elements": [{"text_run": {"content": snapshot.source_line}}]
+    if target.table_value_block_ids:
+        requests = [
+            {
+                "block_id": block_id,
+                "update_text_elements": {
+                    "elements": [{"text_run": {"content": value}}]
+                },
+            }
+            for block_id, value in zip(
+                target.table_value_block_ids, snapshot.table_values
+            )
+        ]
+    else:
+        if not target.source_block_id or not target.count_block_id:
+            raise FeishuSyncError("snapshot paragraph block IDs are missing")
+        requests = [
+            {
+                "block_id": target.source_block_id,
+                "update_text_elements": {
+                    "elements": [{"text_run": {"content": snapshot.source_line}}]
+                },
             },
-        },
-        {
-            "block_id": target.count_block_id,
-            "update_text_elements": {
-                "elements": [{"text_run": {"content": snapshot.count_line}}]
+            {
+                "block_id": target.count_block_id,
+                "update_text_elements": {
+                    "elements": [{"text_run": {"content": snapshot.count_line}}]
+                },
             },
-        },
-    ]
+        ]
     await _request_json(
         client,
         "PATCH",
