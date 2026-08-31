@@ -84,6 +84,65 @@ def _blocks(source_text: str, count_text: str) -> list[dict]:
     ]
 
 
+def _table_blocks(values: tuple[str, ...]) -> list[dict]:
+    rows = [
+        ("指标", "当前值"),
+        ("数据来源", values[0]),
+        ("更新时间", values[1]),
+        ("状态", values[2]),
+        ("中文锚点", values[3]),
+        ("可复用标签", values[4]),
+        ("待审核", values[5]),
+        ("拦截决策", values[6]),
+    ]
+    cell_ids = [f"cell-{index}" for index in range(len(rows) * 2)]
+    blocks = [
+        {
+            "block_id": "heading",
+            "parent_id": "document",
+            "block_type": 4,
+            "heading2": {
+                "elements": [{"text_run": {"content": sync.SNAPSHOT_HEADING}}]
+            },
+        },
+        {
+            "block_id": "table",
+            "parent_id": "document",
+            "block_type": 31,
+            "children": cell_ids,
+            "table": {
+                "cells": cell_ids,
+                "property": {
+                    "column_size": 2,
+                    "row_size": len(rows),
+                    "header_row": True,
+                },
+            },
+        },
+    ]
+    flat_values = [value for row in rows for value in row]
+    for index, (cell_id, value) in enumerate(zip(cell_ids, flat_values)):
+        text_id = f"text-{index}"
+        blocks.append(
+            {
+                "block_id": cell_id,
+                "parent_id": "table",
+                "block_type": 32,
+                "children": [text_id],
+                "table_cell": {},
+            }
+        )
+        blocks.append(
+            {
+                "block_id": text_id,
+                "parent_id": cell_id,
+                "block_type": 2,
+                "text": {"elements": [{"text_run": {"content": value}}]},
+            }
+        )
+    return blocks
+
+
 class FakeAsyncClient:
     def __init__(self, responses):
         self.responses = list(responses)
@@ -157,6 +216,41 @@ class FeishuBlockTests(unittest.TestCase):
         self.assertEqual(target.count_block_id, "count")
         self.assertEqual(target.source_text, source)
         self.assertEqual(target.count_text, count)
+
+    def test_locates_snapshot_table_and_editable_value_blocks(self):
+        values = (
+            "服务器每日词库日报",
+            "2026-08-31 09:00（Asia/Shanghai）",
+            "含告警",
+            "1,251",
+            "996",
+            "64",
+            "11",
+        )
+        target = sync.find_snapshot_target(_table_blocks(values))
+
+        self.assertIsNone(target.source_block_id)
+        self.assertIsNone(target.count_block_id)
+        self.assertEqual(
+            target.source_text,
+            "数据来源：服务器每日词库日报｜更新时间：2026-08-31 09:00（Asia/Shanghai）｜状态：含告警",
+        )
+        self.assertEqual(
+            target.count_text,
+            "中文锚点：1,251｜可复用标签：996｜待审核：64｜拦截决策：11",
+        )
+        self.assertEqual(
+            target.table_value_block_ids,
+            (
+                "text-3",
+                "text-5",
+                "text-7",
+                "text-9",
+                "text-11",
+                "text-13",
+                "text-15",
+            ),
+        )
 
     def test_missing_target_is_an_error(self):
         with self.assertRaises(sync.FeishuSyncError):
@@ -288,6 +382,60 @@ class FeishuSynchronizationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["status"], "skipped")
         self.assertFalse(result["changed"])
         self.assertEqual([call[0] for call in client.calls], ["POST", "GET"])
+
+    async def test_updates_snapshot_table_value_cells(self):
+        report = _report(now=self.now)
+        snapshot = sync.build_library_snapshot(report, now=self.now)
+        old_values = (
+            "服务器每日词库日报",
+            "—",
+            "等待首次同步",
+            "—",
+            "—",
+            "—",
+            "—",
+        )
+        client = FakeAsyncClient(
+            [
+                _token_response(),
+                _response({"items": _table_blocks(old_values), "has_more": False}),
+                _response({}),
+                _response(
+                    {
+                        "items": _table_blocks(snapshot.table_values),
+                        "has_more": False,
+                    }
+                ),
+            ]
+        )
+        with tempfile.TemporaryDirectory() as temp_dir, patch.dict(
+            os.environ, self._environment(temp_dir), clear=False
+        ), patch.object(sync, "get_report_dir", return_value=Path(temp_dir)):
+            self._write_report(temp_dir, report)
+            result = await sync.sync_latest_report_to_doc(now=self.now, client=client)
+
+        self.assertEqual(result["status"], "success")
+        self.assertTrue(result["changed"])
+        patch_body = client.calls[2][2]["json"]
+        self.assertEqual(
+            [request["block_id"] for request in patch_body["requests"]],
+            [
+                "text-3",
+                "text-5",
+                "text-7",
+                "text-9",
+                "text-11",
+                "text-13",
+                "text-15",
+            ],
+        )
+        self.assertEqual(
+            [
+                request["update_text_elements"]["elements"][0]["text_run"]["content"]
+                for request in patch_body["requests"]
+            ],
+            list(snapshot.table_values),
+        )
 
     async def test_revision_conflict_refetches_and_retries_once(self):
         report = _report(now=self.now)
