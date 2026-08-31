@@ -1,4 +1,5 @@
 import unittest
+from datetime import datetime
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 from zoneinfo import ZoneInfo
@@ -21,7 +22,7 @@ class FixedSchedulerTests(unittest.TestCase):
         self.assertEqual(retention_trigger.timezone, task_scheduler.UTC)
         self.assertEqual(task_scheduler.OVERSEAS_CRON, "0 4,16 * * *")
 
-    def test_init_registers_four_idempotent_jobs(self):
+    def test_init_registers_five_idempotent_jobs(self):
         fake_scheduler = MagicMock()
         task_scheduler._scheduler = None
         with patch.object(task_scheduler, "AsyncIOScheduler", return_value=fake_scheduler) as constructor:
@@ -29,7 +30,7 @@ class FixedSchedulerTests(unittest.TestCase):
             task_scheduler.init_scheduler()
 
         constructor.assert_called_once_with(timezone=task_scheduler.SCHEDULER_TIMEZONE)
-        self.assertEqual(fake_scheduler.add_job.call_count, 4)
+        self.assertEqual(fake_scheduler.add_job.call_count, 5)
         ids = {call.kwargs["id"] for call in fake_scheduler.add_job.call_args_list}
         self.assertEqual(
             ids,
@@ -38,6 +39,7 @@ class FixedSchedulerTests(unittest.TestCase):
                 task_scheduler.OVERSEAS_JOB_ID,
                 task_scheduler.RETENTION_JOB_ID,
                 task_scheduler.DAILY_REPORT_JOB_ID,
+                task_scheduler.FEISHU_SYNC_JOB_ID,
             },
         )
         for call in fake_scheduler.add_job.call_args_list:
@@ -46,7 +48,10 @@ class FixedSchedulerTests(unittest.TestCase):
             self.assertEqual(call.kwargs["max_instances"], 1)
             expected_grace = (
                 3600
-                if call.kwargs["id"] == task_scheduler.DAILY_REPORT_JOB_ID
+                if call.kwargs["id"] in {
+                    task_scheduler.DAILY_REPORT_JOB_ID,
+                    task_scheduler.FEISHU_SYNC_JOB_ID,
+                }
                 else 60
             )
             self.assertEqual(call.kwargs["misfire_grace_time"], expected_grace)
@@ -55,6 +60,11 @@ class FixedSchedulerTests(unittest.TestCase):
     def test_daily_report_trigger_uses_declared_timezone(self):
         trigger = task_scheduler._build_trigger(task_scheduler.DAILY_REPORT_CRON)
         self.assertEqual(trigger.timezone, ZoneInfo("Asia/Shanghai"))
+
+    def test_feishu_sync_trigger_uses_declared_timezone(self):
+        trigger = task_scheduler._build_trigger(task_scheduler.FEISHU_SYNC_CRON)
+        self.assertEqual(trigger.timezone, ZoneInfo("Asia/Shanghai"))
+        self.assertEqual(task_scheduler.FEISHU_SYNC_CRON, "10 9 * * *")
 
     def test_status_is_read_only_and_exposes_fixed_jobs(self):
         task_scheduler._scheduler = None
@@ -91,6 +101,44 @@ class DailyReportSchedulerTests(unittest.IsolatedAsyncioTestCase):
         audit.assert_awaited_once()
         self.assertEqual(audit.await_args.args[0], "report.daily.auto")
         self.assertEqual(audit.await_args.kwargs["resource_type"], "daily_report")
+
+    async def test_feishu_sync_records_aggregate_audit(self):
+        report_date = datetime.now(task_scheduler.SCHEDULER_TIMEZONE).date().isoformat()
+        with patch(
+            "services.feishu_library_sync.sync_latest_report_to_doc",
+            new=AsyncMock(
+                return_value={
+                    "status": "skipped",
+                    "report_date": report_date,
+                    "changed": False,
+                }
+            ),
+        ), patch.object(
+            task_scheduler, "_record_auto_audit", new_callable=AsyncMock
+        ) as audit:
+            result = await task_scheduler._run_feishu_sync_async()
+
+        self.assertEqual(result["status"], "skipped")
+        audit.assert_awaited_once()
+        self.assertEqual(audit.await_args.args[0], "report.feishu.auto")
+        self.assertEqual(audit.await_args.kwargs["resource_type"], "feishu_snapshot")
+        self.assertEqual(audit.await_args.kwargs["detail"]["changed"], False)
+
+    async def test_feishu_sync_failure_records_error_type_only(self):
+        with patch(
+            "services.feishu_library_sync.sync_latest_report_to_doc",
+            new=AsyncMock(side_effect=RuntimeError("secret response")),
+        ), patch.object(
+            task_scheduler, "_record_auto_audit", new_callable=AsyncMock
+        ) as audit:
+            result = await task_scheduler._run_feishu_sync_async()
+
+        self.assertEqual(result["status"], "failed")
+        audit.assert_awaited_once()
+        self.assertEqual(audit.await_args.kwargs["status"], "failed")
+        detail = audit.await_args.kwargs["detail"]
+        self.assertEqual(detail["error_type"], "RuntimeError")
+        self.assertNotIn("secret response", str(detail))
 
 
 class CollectionJobTests(unittest.IsolatedAsyncioTestCase):

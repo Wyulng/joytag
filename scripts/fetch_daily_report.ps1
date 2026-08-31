@@ -26,11 +26,13 @@ if (-not (Test-Path -LiteralPath $SshKeyPath -PathType Leaf)) {
     throw "SSH key was not found at the configured path."
 }
 
-function Invoke-RemoteReportFile {
+function Invoke-RemoteReportBytes {
     param([Parameter(Mandatory = $true)][string]$FileName)
 
     $target = "$SshUser@$SshHost"
-    $remoteCommand = "docker exec $RemoteContainer cat $RemoteReportDir/$FileName"
+    # SSH output is transported as ASCII Base64 so Windows PowerShell cannot
+    # reinterpret the report bytes through the local console code page.
+    $remoteCommand = "docker exec $RemoteContainer base64 -w 0 $RemoteReportDir/$FileName"
     $sshArgs = @(
         "-p", "$SshPort",
         "-i", $SshKeyPath,
@@ -38,25 +40,49 @@ function Invoke-RemoteReportFile {
         $target,
         $remoteCommand
     )
-    $content = & ssh @sshArgs 2>&1
+    $encoded = & ssh @sshArgs 2>$null
     if ($LASTEXITCODE -ne 0) {
         throw "Remote report fetch failed for $FileName (exit code $LASTEXITCODE)."
     }
-    return ($content -join [Environment]::NewLine)
+    $encodedText = ($encoded -join "") -replace "\s", ""
+    if ([string]::IsNullOrWhiteSpace($encodedText)) {
+        throw "Remote report fetch returned no data for $FileName."
+    }
+    try {
+        $bytes = [Convert]::FromBase64String($encodedText)
+        return ,$bytes
+    }
+    catch {
+        throw "Remote report fetch returned invalid Base64 for $FileName."
+    }
 }
 
-function Write-AtomicText {
+function Convert-ReportBytesToText {
+    param(
+        [Parameter(Mandatory = $true)][byte[]]$Bytes,
+        [Parameter(Mandatory = $true)][string]$FileName
+    )
+
+    try {
+        $utf8 = [System.Text.UTF8Encoding]::new($false, $true)
+        return $utf8.GetString($Bytes)
+    }
+    catch {
+        throw "Remote report is not valid UTF-8 for $FileName."
+    }
+}
+
+function Write-AtomicBytes {
     param(
         [Parameter(Mandatory = $true)][string]$Path,
-        [Parameter(Mandatory = $true)][string]$Content
+        [Parameter(Mandatory = $true)][byte[]]$Bytes
     )
 
     $parent = Split-Path -Parent $Path
     New-Item -ItemType Directory -Path $parent -Force | Out-Null
     $temp = "$Path.$([guid]::NewGuid().ToString('N')).tmp"
     try {
-        $utf8 = [System.Text.UTF8Encoding]::new($false)
-        [System.IO.File]::WriteAllText($temp, $Content, $utf8)
+        [System.IO.File]::WriteAllBytes($temp, $Bytes)
         Move-Item -LiteralPath $temp -Destination $Path -Force
     }
     finally {
@@ -66,8 +92,10 @@ function Write-AtomicText {
     }
 }
 
-$jsonText = Invoke-RemoteReportFile -FileName "latest.json"
-$markdownText = Invoke-RemoteReportFile -FileName "latest.md"
+$jsonBytes = Invoke-RemoteReportBytes -FileName "latest.json"
+$markdownBytes = Invoke-RemoteReportBytes -FileName "latest.md"
+$jsonText = Convert-ReportBytesToText -Bytes $jsonBytes -FileName "latest.json"
+$markdownText = Convert-ReportBytesToText -Bytes $markdownBytes -FileName "latest.md"
 
 try {
     $report = $jsonText | ConvertFrom-Json
@@ -114,10 +142,10 @@ try {
     $dateMarkdown = Join-Path $staging "daily-$expectedDate.md"
     $latestJson = Join-Path $staging "latest.json"
     $latestMarkdown = Join-Path $staging "latest.md"
-    Write-AtomicText -Path $dateJson -Content $jsonText
-    Write-AtomicText -Path $dateMarkdown -Content $markdownText
-    Write-AtomicText -Path $latestJson -Content $jsonText
-    Write-AtomicText -Path $latestMarkdown -Content $markdownText
+    Write-AtomicBytes -Path $dateJson -Bytes $jsonBytes
+    Write-AtomicBytes -Path $dateMarkdown -Bytes $markdownBytes
+    Write-AtomicBytes -Path $latestJson -Bytes $jsonBytes
+    Write-AtomicBytes -Path $latestMarkdown -Bytes $markdownBytes
 
     New-Item -ItemType Directory -Path $OutputDir -Force | Out-Null
     foreach ($file in @($dateJson, $dateMarkdown, $latestJson, $latestMarkdown)) {
