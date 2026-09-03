@@ -304,10 +304,8 @@ def observe_candidates(
     source: str,
     run_id: str | None = None,
     observed_at: datetime | None = None,
-) -> None:
-    """批量记录响应发生变化后发现的候选词。"""
-    if not db.is_db_available():
-        return
+) -> dict[str, int | bool | str | None]:
+    """批量记录候选词并返回不含原文的写入摘要。"""
     now = observed_at or utc_now()
     rows = []
     for candidate in candidates:
@@ -328,7 +326,26 @@ def observe_candidates(
             run_id or "",
         ))
     if not rows:
-        return
+        return {
+            "attempted": 0,
+            "written": 0,
+            "write_failed": False,
+            "error_type": None,
+        }
+    if not db.is_db_available():
+        logger.warning(
+            "[collector_candidate_observation_write_failed] pipeline=%s country=%s "
+            "attempted=%d error_type=database_unavailable",
+            pipeline,
+            country or "",
+            len(rows),
+        )
+        return {
+            "attempted": len(rows),
+            "written": 0,
+            "write_failed": True,
+            "error_type": "database_unavailable",
+        }
     try:
         db.execute_many(
             """
@@ -360,8 +377,28 @@ def observe_candidates(
             """,
             rows,
         )
+        return {
+            "attempted": len(rows),
+            "written": len(rows),
+            "write_failed": False,
+            "error_type": None,
+        }
     except Exception as exc:
         _warn_db("candidate observation", exc)
+        logger.warning(
+            "[collector_candidate_observation_write_failed] pipeline=%s country=%s "
+            "attempted=%d error_type=%s",
+            pipeline,
+            country or "",
+            len(rows),
+            type(exc).__name__,
+        )
+        return {
+            "attempted": len(rows),
+            "written": 0,
+            "write_failed": True,
+            "error_type": type(exc).__name__,
+        }
 
 
 def mark_candidate_processed(

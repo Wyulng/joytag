@@ -4,7 +4,7 @@ from uuid import UUID
 import hashlib
 import logging
 from datetime import datetime, timezone
-from typing import Iterator
+from typing import Iterable, Iterator
 from qdrant_client import QdrantClient
 
 logger = logging.getLogger(__name__)
@@ -241,6 +241,46 @@ def cn_anchor_exists(cn_word: str) -> bool:
         with_vectors=False
     )
     return len(points) > 0
+
+
+def cn_anchors_exist(cn_words: Iterable[str], *, batch_size: int = 256) -> set[str]:
+    """批量检查中文锚点，返回已经存在的原始词集合。
+
+    中文锚点使用 ``_generate_deterministic_id(cn_word)`` 作为唯一键，
+    因此可以用分块 retrieve 替代逐词请求。返回原始词而不是重算
+    规范化键，避免改变历史确定性 ID；调用方负责按自己的去重规则比较。
+    """
+    if batch_size <= 0:
+        raise ValueError("batch_size must be positive")
+
+    words: list[str] = []
+    seen: set[str] = set()
+    for word in cn_words:
+        if not isinstance(word, str) or not word:
+            continue
+        if word in seen:
+            continue
+        seen.add(word)
+        words.append(word)
+    if not words:
+        return set()
+
+    client = get_qdrant_client()
+    existing: set[str] = set()
+    for start in range(0, len(words), batch_size):
+        chunk = words[start:start + batch_size]
+        ids = [_generate_deterministic_id(word) for word in chunk]
+        points = client.retrieve(
+            collection_name=ANCHOR_COLLECTION,
+            ids=ids,
+            with_payload=False,
+            with_vectors=False,
+        )
+        found_ids = {str(point.id) for point in points}
+        existing.update(
+            word for word, point_id in zip(chunk, ids) if point_id in found_ids
+        )
+    return existing
 
 
 # ==================== 本地化 Tag 操作 ====================

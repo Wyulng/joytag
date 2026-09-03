@@ -1,11 +1,13 @@
 import unittest
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from services import collector_state
 from services import db
 from services.collectors import cn_ecommerce
 from services.collectors import amazon_suggest
+from services.qdrant_store import ANCHOR_COLLECTION, _generate_deterministic_id, cn_anchors_exist
 
 
 class _Response:
@@ -124,6 +126,156 @@ class ChineseSourceTests(unittest.TestCase):
         self.assertFalse(cn_ecommerce._seed_is_due({"next_query_at": future}, datetime.now(timezone.utc)))
 
 
+class ChineseCandidateSelectionTests(unittest.TestCase):
+    def _seed(self, *, depth=0):
+        return {
+            "seed_word": "女装",
+            "normalized_seed": "女装",
+            "seed_kind": "fixed",
+            "category": "服装",
+            "seed_depth": depth,
+        }
+
+    def test_observes_all_candidates_and_filters_existing_before_limit(self):
+        seed = self._seed(depth=2)
+        items = [
+            {"word": "已有锚点", "rank": 0, "raw_heat": 10},
+            {"word": "新词甲", "rank": 1, "raw_heat": 9},
+            {"word": "新词乙", "rank": 2, "raw_heat": 8},
+        ]
+        observation_result = {
+            "attempted": 3,
+            "written": 3,
+            "write_failed": False,
+            "error_type": None,
+        }
+        with (
+            patch.object(cn_ecommerce, "_select_seed_records", return_value=[seed]),
+            patch.object(cn_ecommerce, "_fetch_one_seed", return_value=(items, "request", True)),
+            patch.object(cn_ecommerce.collector_state, "mark_seed_queried"),
+            patch.object(cn_ecommerce.collector_state, "get_candidate_observations", return_value={}),
+            patch.object(
+                cn_ecommerce.collector_state,
+                "observe_candidates",
+                return_value=observation_result,
+            ) as observe,
+            patch.object(cn_ecommerce.collector_state, "upsert_seed_frontier"),
+            patch.object(cn_ecommerce.collector_state, "list_seed_frontier", return_value=[seed]),
+            patch.object(cn_ecommerce.collector_state, "trim_seed_frontier") as trim,
+            patch.object(cn_ecommerce, "cn_anchors_exist", return_value={"已有锚点"}) as existing,
+        ):
+            selected = cn_ecommerce.get_cn_trending_words("run-1")
+
+        self.assertEqual([word for word, _heat, _category in selected], ["新词甲", "新词乙"])
+        self.assertEqual(observe.call_count, 1)
+        self.assertEqual(len(observe.call_args.args[2]), 3)
+        self.assertEqual(observe.call_args.kwargs["run_id"], "run-1")
+        existing.assert_called_once_with(["已有锚点", "新词甲", "新词乙"])
+        trim.assert_called_once_with(cn_ecommerce.CN_MAX_FRONTIER)
+        stats = cn_ecommerce.get_last_collection_stats()
+        self.assertEqual(stats["candidate_observations"], 3)
+        self.assertEqual(stats["candidate_observations_backfilled"], 3)
+        self.assertEqual(stats["eligible_before_qdrant"], 3)
+        self.assertEqual(stats["qdrant_existing_filtered"], 1)
+        self.assertEqual(stats["selected_candidates"], 2)
+
+    def test_cached_snapshot_missing_observations_is_backfilled_without_new_seed(self):
+        seed = self._seed()
+        items = [{"word": "快照新词", "rank": 0, "raw_heat": 3}]
+        with (
+            patch.object(cn_ecommerce, "_select_seed_records", return_value=[seed]),
+            patch.object(cn_ecommerce, "_fetch_one_seed", return_value=(items, "cache", False)),
+            patch.object(cn_ecommerce.collector_state, "get_candidate_observations", return_value={}),
+            patch.object(
+                cn_ecommerce.collector_state,
+                "observe_candidates",
+                return_value={"attempted": 1, "written": 1, "write_failed": False},
+            ) as observe,
+            patch.object(cn_ecommerce.collector_state, "list_seed_frontier", return_value=[seed]),
+            patch.object(cn_ecommerce.collector_state, "trim_seed_frontier"),
+            patch.object(cn_ecommerce, "cn_anchors_exist", return_value=set()),
+        ):
+            selected = cn_ecommerce.get_cn_trending_words("run-cache")
+
+        self.assertEqual([word for word, _heat, _category in selected], ["快照新词"])
+        observe.assert_called_once()
+        self.assertEqual(observe.call_args.kwargs["run_id"], "run-cache")
+
+    def test_existing_observations_are_not_rewritten_for_unchanged_snapshot(self):
+        seed = self._seed()
+        items = [{"word": "已观察词", "rank": 0, "raw_heat": 3}]
+        observation = {
+            "normalized_word": "已观察词",
+            "decision_status": None,
+            "next_eligible_at": None,
+        }
+        with (
+            patch.object(cn_ecommerce, "_select_seed_records", return_value=[seed]),
+            patch.object(cn_ecommerce, "_fetch_one_seed", return_value=(items, "cache", False)),
+            patch.object(
+                cn_ecommerce.collector_state,
+                "get_candidate_observations",
+                return_value={"已观察词": observation},
+            ),
+            patch.object(cn_ecommerce.collector_state, "observe_candidates") as observe,
+            patch.object(cn_ecommerce.collector_state, "list_seed_frontier", return_value=[seed]),
+            patch.object(cn_ecommerce.collector_state, "trim_seed_frontier"),
+            patch.object(cn_ecommerce, "cn_anchors_exist", return_value=set()),
+        ):
+            cn_ecommerce.get_cn_trending_words("run-unchanged")
+
+        observe.assert_not_called()
+        self.assertEqual(cn_ecommerce.get_last_collection_stats()["candidate_observations"], 0)
+
+    def test_frontier_is_trimmed_after_dynamic_expansion(self):
+        seed = self._seed()
+        before = [
+            {
+                "seed_kind": "suggestion",
+                "seed_word": f"动态{index}",
+            }
+            for index in range(cn_ecommerce.CN_MAX_FRONTIER + 3)
+        ]
+        after = before[:cn_ecommerce.CN_MAX_FRONTIER]
+        with (
+            patch.object(cn_ecommerce, "_select_seed_records", return_value=[seed]),
+            patch.object(cn_ecommerce, "_fetch_one_seed", return_value=([], "cache", False)),
+            patch.object(cn_ecommerce.collector_state, "list_seed_frontier", side_effect=[before, after]),
+            patch.object(cn_ecommerce.collector_state, "trim_seed_frontier") as trim,
+        ):
+            selected = cn_ecommerce.get_cn_trending_words("run-frontier")
+
+        self.assertEqual(selected, [])
+        trim.assert_called_once_with(cn_ecommerce.CN_MAX_FRONTIER)
+        stats = cn_ecommerce.get_last_collection_stats()
+        self.assertEqual(stats["active_dynamic_seeds"], cn_ecommerce.CN_MAX_FRONTIER)
+        self.assertEqual(stats["frontier_trimmed"], 3)
+
+
+class QdrantBatchLookupTests(unittest.TestCase):
+    def test_cn_anchors_exist_retrieves_ids_in_chunks(self):
+        client = MagicMock()
+        first_id = _generate_deterministic_id("词甲")
+        second_id = _generate_deterministic_id("词乙")
+        client.retrieve.side_effect = [
+            [SimpleNamespace(id=first_id)],
+            [SimpleNamespace(id=second_id)],
+        ]
+        with patch("services.qdrant_store.get_qdrant_client", return_value=client):
+            existing = cn_anchors_exist(["词甲", "词乙"], batch_size=1)
+
+        self.assertEqual(existing, {"词甲", "词乙"})
+        self.assertEqual(client.retrieve.call_count, 2)
+        self.assertEqual(
+            client.retrieve.call_args_list[0].kwargs["ids"],
+            [first_id],
+        )
+        self.assertEqual(
+            client.retrieve.call_args_list[1].kwargs["ids"],
+            [second_id],
+        )
+
+
 class SourceSnapshotTests(unittest.TestCase):
     def tearDown(self):
         amazon_suggest.close_fetch_executor()
@@ -150,6 +302,44 @@ class CollectorStateTests(unittest.TestCase):
             collector_state.normalize_collector_key("C++"),
             collector_state.normalize_collector_key("C"),
         )
+
+    def test_observe_candidates_writes_batch_with_collection_run_id(self):
+        with (
+            patch.object(db, "is_db_available", return_value=True),
+            patch.object(db, "execute_many") as execute_many,
+        ):
+            result = collector_state.observe_candidates(
+                "cn",
+                "CN",
+                [{"word": "夏季连衣裙", "source_heat_score": 0.8}],
+                source="taobao_suggest",
+                run_id="run-42",
+            )
+
+        self.assertEqual(result["attempted"], 1)
+        self.assertEqual(result["written"], 1)
+        self.assertFalse(result["write_failed"])
+        rows = execute_many.call_args.args[1]
+        self.assertEqual(rows[0][8], "run-42")
+
+    def test_observe_candidates_reports_write_failure_without_raising(self):
+        with (
+            patch.object(db, "is_db_available", return_value=True),
+            patch.object(db, "execute_many", side_effect=RuntimeError("db down")),
+            self.assertLogs("services.collector_state", level="WARNING") as logs,
+        ):
+            result = collector_state.observe_candidates(
+                "cn",
+                "CN",
+                [{"word": "失败候选", "source_heat_score": 0.5}],
+                source="taobao_suggest",
+            )
+
+        self.assertEqual(result["attempted"], 1)
+        self.assertEqual(result["written"], 0)
+        self.assertTrue(result["write_failed"])
+        self.assertEqual(result["error_type"], "RuntimeError")
+        self.assertTrue(any("attempted=1" in message for message in logs.output))
 
 
 if __name__ == "__main__":

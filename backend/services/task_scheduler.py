@@ -84,7 +84,11 @@ def _safe_result(result: Any) -> dict[str, Any]:
         "skipped", "embedding_words", "assess_calls", "source_requests",
         "source_cache_hits", "source_errors", "source_response_changes",
         "seed_queries", "dynamic_seeds", "fixed_seeds", "raw_candidates",
-        "unique_candidates",
+        "unique_candidates", "candidate_observations",
+        "candidate_observations_backfilled", "candidate_observation_write_failed",
+        "candidate_observation_error_type",
+        "eligible_before_qdrant", "qdrant_existing_filtered", "selected_candidates",
+        "active_dynamic_seeds", "frontier_trimmed", "qdrant_existing_filter_failed",
     }
     return {
         key: value
