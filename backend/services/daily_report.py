@@ -190,7 +190,11 @@ def _safe_result(value: Any) -> dict[str, Any]:
         "skipped", "embedding_words", "assess_calls", "source_requests",
         "source_cache_hits", "source_errors", "source_response_changes",
         "seed_queries", "dynamic_seeds", "fixed_seeds", "raw_candidates",
-        "unique_candidates",
+        "unique_candidates", "candidate_observations",
+        "candidate_observations_backfilled", "candidate_observation_write_failed",
+        "candidate_observation_error_type",
+        "eligible_before_qdrant", "qdrant_existing_filtered", "selected_candidates",
+        "active_dynamic_seeds", "frontier_trimmed", "qdrant_existing_filter_failed",
     }
     return {
         key: _scalar(item)
@@ -504,6 +508,17 @@ async def generate_daily_report(now: datetime | None = None) -> dict[str, Any]:
                 report["warnings"].append(f"lineage_incomplete:{job_name}")
         if db_summary["collector_state"].get("candidate_observation_total", 0) == 0:
             report["warnings"].append("collector_candidate_observation_empty")
+        cn_result = (
+            db_summary.get("auto_runs", {})
+            .get("collect.cn.auto", {})
+            .get("result", {})
+        )
+        if cn_result.get("candidate_observation_write_failed"):
+            report["warnings"].append("collector_candidate_observation_write_failed")
+        if cn_result.get("qdrant_existing_filter_failed"):
+            report["warnings"].append("cn_anchor_prefilter_failed")
+        if int(cn_result.get("active_dynamic_seeds") or 0) > 2000:
+            report["warnings"].append("cn_dynamic_seed_frontier_exceeded")
         rerank_count = db_summary["llm"].get("by_type", {}).get("rerank", {}).get("count", 0)
         if os.getenv("RECOMMEND_RERANK_MODE", "vector").strip().lower() == "vector" and rerank_count:
             report["warnings"].append("unexpected_rerank_trace_in_vector_mode")

@@ -14,6 +14,7 @@ from datetime import datetime, timezone
 
 from services import collector_state
 from services.collectors.cn_sources import get_cn_source_adapter
+from services.qdrant_store import cn_anchors_exist
 
 logger = logging.getLogger(__name__)
 
@@ -372,7 +373,9 @@ def get_last_collection_stats() -> dict:
     return dict(_LAST_COLLECTION_STATS)
 
 
-def get_cn_trending_words() -> list[tuple[str, float, str | None]]:
+def get_cn_trending_words(
+    collection_run_id: str | None = None,
+) -> list[tuple[str, float, str | None]]:
     """获取中文建议词：动态种子优先、固定种子轮换、响应热度排序。"""
     global _LAST_COLLECTION_STATS
     # 选择器本身负责 64/16 配额，这里再次硬截断，防止后续适配器或测试替换
@@ -390,6 +393,16 @@ def get_cn_trending_words() -> list[tuple[str, float, str | None]]:
             "unique_candidates": 0,
             "dynamic_seeds": 0,
             "fixed_seeds": 0,
+            "candidate_observations": 0,
+            "candidate_observations_backfilled": 0,
+            "candidate_observation_write_failed": 0,
+            "candidate_observation_error_type": None,
+            "eligible_before_qdrant": 0,
+            "qdrant_existing_filtered": 0,
+            "selected_candidates": 0,
+            "active_dynamic_seeds": 0,
+            "frontier_trimmed": 0,
+            "qdrant_existing_filter_failed": False,
         }
         return []
 
@@ -422,6 +435,35 @@ def get_cn_trending_words() -> list[tuple[str, float, str | None]]:
 
     aggregate, changed_candidates = _aggregate_suggestions(seed_results)
 
+    keys = list(aggregate)
+    observations_before = collector_state.get_candidate_observations("cn", "CN", keys)
+
+    # 候选观察是跨轮次去重的基础，不应受动态种子晋升的热度/深度门槛影响。
+    # 对当前快照中尚无记录的候选做一次惰性补登记；对响应发生变化的候选
+    # 更新热度和最近发现时间。两类候选合并为一次批量写入，避免重复 DB 往返。
+    observation_candidates: list[dict] = []
+    observation_keys: set[str] = set()
+    for entry in aggregate.values():
+        key = collector_state.normalize_collector_key(entry["word"])
+        if key not in observations_before:
+            observation_candidates.append(entry)
+            observation_keys.add(key)
+    for entry in changed_candidates:
+        key = collector_state.normalize_collector_key(entry["word"])
+        if key and key not in observation_keys:
+            observation_candidates.append(entry)
+            observation_keys.add(key)
+
+    observation_result = {"write_failed": False, "attempted": 0, "error_type": None}
+    if observation_candidates:
+        observation_result = collector_state.observe_candidates(
+            "cn",
+            "CN",
+            observation_candidates,
+            source="taobao_suggest",
+            run_id=collection_run_id,
+        ) or observation_result
+
     # 只在响应首次出现或发生变化时扩展动态种子，避免缓存命中重复污染 frontier。
     for entry in changed_candidates:
         if (
@@ -440,14 +482,21 @@ def get_cn_trending_words() -> list[tuple[str, float, str | None]]:
             seed_depth=depth,
             source_heat_score=entry["source_heat_score"],
         )
-        collector_state.observe_candidates(
-            "cn",
-            "CN",
-            [entry],
-            source="taobao_suggest",
-        )
 
-    keys = list(aggregate)
+    # 动态种子扩展发生在任务开始时的裁剪之后，因此必须在扩展完成后
+    # 再裁剪一次，保证任务结束时始终满足 frontier 上限。
+    frontier_before_trim = collector_state.list_seed_frontier()
+    collector_state.trim_seed_frontier(CN_MAX_FRONTIER)
+    frontier_after_trim = collector_state.list_seed_frontier()
+    active_dynamic_seeds = sum(
+        1 for item in frontier_after_trim if item.get("seed_kind") != "fixed"
+    )
+    frontier_trimmed = max(
+        0,
+        sum(1 for item in frontier_before_trim if item.get("seed_kind") != "fixed")
+        - active_dynamic_seeds,
+    )
+
     observations = collector_state.get_candidate_observations("cn", "CN", keys)
     now = datetime.now(timezone.utc)
 
@@ -482,7 +531,34 @@ def get_cn_trending_words() -> list[tuple[str, float, str | None]]:
             collector_state.normalize_collector_key(item["word"]),
         ),
     )
-    selected = sorted_entries[:MAX_WORDS_PER_COLLECTION]
+    eligible_before_qdrant = len(sorted_entries)
+    existing_anchor_keys: set[str] = set()
+    qdrant_existing_filter_failed = False
+    if sorted_entries:
+        try:
+            existing_anchor_words = cn_anchors_exist(
+                [entry["word"] for entry in sorted_entries]
+            )
+            existing_anchor_keys = {
+                collector_state.normalize_collector_key(word)
+                for word in existing_anchor_words
+            }
+        except Exception as exc:
+            qdrant_existing_filter_failed = True
+            logger.warning(
+                "[cn_anchor_prefilter_failed] error_type=%s candidates=%d",
+                type(exc).__name__,
+                len(sorted_entries),
+            )
+
+    filtered_entries = [
+        entry
+        for entry in sorted_entries
+        if collector_state.normalize_collector_key(entry["word"])
+        not in existing_anchor_keys
+    ]
+    selected = filtered_entries[:MAX_WORDS_PER_COLLECTION]
+    qdrant_existing_filtered = eligible_before_qdrant - len(filtered_entries)
     raw_candidates = sum(len(items) for _, items, _ in seed_results)
     _LAST_COLLECTION_STATS = {
         "source": "taobao_suggest",
@@ -495,6 +571,24 @@ def get_cn_trending_words() -> list[tuple[str, float, str | None]]:
         "unique_candidates": len(aggregate),
         "dynamic_seeds": sum(1 for seed in seed_records if seed.get("seed_kind") != "fixed"),
         "fixed_seeds": sum(1 for seed in seed_records if seed.get("seed_kind") == "fixed"),
+        "candidate_observations": len(observation_candidates),
+        "candidate_observations_backfilled": sum(
+            1 for entry in observation_candidates
+            if collector_state.normalize_collector_key(entry["word"])
+            not in observations_before
+        ),
+        "candidate_observation_write_failed": (
+            int(observation_result.get("attempted") or 0)
+            if observation_result.get("write_failed")
+            else 0
+        ),
+        "candidate_observation_error_type": observation_result.get("error_type"),
+        "eligible_before_qdrant": eligible_before_qdrant,
+        "qdrant_existing_filtered": qdrant_existing_filtered,
+        "selected_candidates": len(selected),
+        "active_dynamic_seeds": active_dynamic_seeds,
+        "frontier_trimmed": frontier_trimmed,
+        "qdrant_existing_filter_failed": qdrant_existing_filter_failed,
     }
     return [
         (entry["word"], float(entry["source_heat_score"]), entry.get("category"))

@@ -9,7 +9,7 @@ from services.alignment import process_cn_longtail_word
 from services.collectors.cn_ecommerce import get_cn_trending_words, get_last_collection_stats
 from services import collector_state
 from services.embedding import get_embeddings
-from services.qdrant_store import cn_anchor_exists
+from services.qdrant_store import cn_anchors_exist
 from services.lineage import record_event, EVENT_START, EVENT_COMPLETE, EVENT_FAIL
 
 logger = logging.getLogger(__name__)
@@ -41,9 +41,9 @@ def _save_progress(progress: dict):
         pass
 
 
-async def fetch_cn_longtail_words():
+async def fetch_cn_longtail_words(collection_run_id: str | None = None):
     return await asyncio.wait_for(
-        asyncio.to_thread(get_cn_trending_words),
+        asyncio.to_thread(get_cn_trending_words, collection_run_id),
         timeout=300
     )
 
@@ -64,7 +64,7 @@ async def _collect_cn_generator():
     processed_keys = {collector_state.normalize_collector_key(word) for word in processed_words}
 
     try:
-        words_with_heat = await fetch_cn_longtail_words()
+        words_with_heat = await fetch_cn_longtail_words(run_id)
     except Exception:
         record_event(
             run_id=run_id,
@@ -95,6 +95,7 @@ async def _collect_cn_generator():
         exists_by_key: dict[str, bool] = {}
         new_words: list[str] = []
         word_by_key: dict[str, str] = {}
+        qdrant_lookup_words: list[str] = []
         for cn_word, _heat, _category in words_with_heat:
             key = collector_state.normalize_collector_key(cn_word)
             if not key or key in word_by_key:
@@ -111,7 +112,16 @@ async def _collect_cn_generator():
             ):
                 exists_by_key[key] = True
                 continue
-            exists_in_db = cn_anchor_exists(cn_word)
+            qdrant_lookup_words.append(cn_word)
+
+        existing_anchor_words = cn_anchors_exist(qdrant_lookup_words)
+        existing_anchor_keys = {
+            collector_state.normalize_collector_key(word)
+            for word in existing_anchor_words
+        }
+        for cn_word in qdrant_lookup_words:
+            key = collector_state.normalize_collector_key(cn_word)
+            exists_in_db = key in existing_anchor_keys
             exists_by_key[key] = exists_in_db
             if not exists_in_db:
                 new_words.append(cn_word)

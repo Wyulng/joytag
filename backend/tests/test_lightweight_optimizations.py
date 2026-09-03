@@ -216,7 +216,7 @@ class CollectorBatchIntegrationTests(unittest.IsolatedAsyncioTestCase):
             patch.object(cn_longtail, "_load_progress", return_value={"processed_words": []}),
             patch.object(cn_longtail, "_save_progress"),
             patch.object(cn_longtail, "fetch_cn_longtail_words", new=AsyncMock(return_value=words)),
-            patch.object(cn_longtail, "cn_anchor_exists", return_value=False),
+            patch.object(cn_longtail, "cn_anchors_exist", return_value=set()) as qdrant_lookup,
             patch.object(cn_longtail, "get_embeddings", new=AsyncMock(return_value=vectors)) as batch,
             patch.object(cn_longtail, "process_cn_longtail_word", new=AsyncMock()) as process,
             patch.object(cn_longtail, "record_event"),
@@ -224,6 +224,7 @@ class CollectorBatchIntegrationTests(unittest.IsolatedAsyncioTestCase):
             results = [item async for item in cn_longtail._collect_cn_generator()]
 
         self.assertEqual(batch.await_args.args[0], ["a", "b"])
+        qdrant_lookup.assert_called_once_with(["a", "b"])
         self.assertEqual(process.await_count, 2)
         self.assertEqual(process.call_args_list[0].kwargs["vector"], vectors[0])
         self.assertEqual(results[-1]["new"], 2)
