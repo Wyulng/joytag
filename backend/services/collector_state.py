@@ -322,6 +322,7 @@ def observe_candidates(
             json.dumps(list(dict.fromkeys(source_set)), ensure_ascii=False),
             candidate.get("category"),
             now,
+            now,
             float(candidate.get("source_heat_score") or candidate.get("heat") or 0.0),
             run_id or "",
         ))

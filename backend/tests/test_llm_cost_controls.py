@@ -643,7 +643,7 @@ class RuleNormalizationTests(unittest.TestCase):
 class DisclosureVersionTests(unittest.IsolatedAsyncioTestCase):
     async def test_disclosure_versions_and_dates_are_synchronized(self):
         self.assertEqual(DISCLOSURE_VERSION, "2026-08-25")
-        self.assertEqual(TRANSPARENCY_VERSION, "2026-08-25")
+        self.assertEqual(TRANSPARENCY_VERSION, "2026-10-15")
 
         with patch("app.get_recommend_rerank_mode", return_value="vector"):
             disclosure = await app_module.disclosure_parameters()
@@ -664,8 +664,8 @@ class DisclosureVersionTests(unittest.IsolatedAsyncioTestCase):
             from services.transparency import transparency_payload
 
             payload = transparency_payload()
-        self.assertEqual(payload["version"], "2026-08-25")
-        self.assertEqual(payload["last_updated"], "2026-08-25")
+        self.assertEqual(payload["version"], "2026-10-15")
+        self.assertEqual(payload["last_updated"], "2026-10-15")
 
 
 if __name__ == "__main__":
