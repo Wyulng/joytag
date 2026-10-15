@@ -100,7 +100,7 @@ class ChineseSourceTests(unittest.TestCase):
                 "last_queried_at": None,
                 "next_query_at": None,
             }
-            for index in range(70)
+            for index in range(90)
         ] + [
             {
                 "seed_word": f"固定{index}",
@@ -112,14 +112,14 @@ class ChineseSourceTests(unittest.TestCase):
                 "last_queried_at": None,
                 "next_query_at": None,
             }
-            for index in range(30)
+            for index in range(40)
         ]
         with patch.object(cn_ecommerce, "_ensure_seed_frontier", return_value=frontier):
             selected = cn_ecommerce._select_seed_records()
 
-        self.assertEqual(len(selected), 80)
-        self.assertEqual(sum(item["seed_kind"] != "fixed" for item in selected), 64)
-        self.assertEqual(sum(item["seed_kind"] == "fixed" for item in selected), 16)
+        self.assertEqual(len(selected), 100)
+        self.assertEqual(sum(item["seed_kind"] != "fixed" for item in selected), 80)
+        self.assertEqual(sum(item["seed_kind"] == "fixed" for item in selected), 20)
 
     def test_dynamic_seed_is_not_due_during_cooldown(self):
         future = datetime.now(timezone.utc) + timedelta(days=1)
@@ -308,19 +308,26 @@ class CollectorStateTests(unittest.TestCase):
             patch.object(db, "is_db_available", return_value=True),
             patch.object(db, "execute_many") as execute_many,
         ):
+            observed_at = datetime(2026, 10, 15, 0, 0, tzinfo=timezone.utc)
             result = collector_state.observe_candidates(
                 "cn",
                 "CN",
                 [{"word": "夏季连衣裙", "source_heat_score": 0.8}],
                 source="taobao_suggest",
                 run_id="run-42",
+                observed_at=observed_at,
             )
 
         self.assertEqual(result["attempted"], 1)
         self.assertEqual(result["written"], 1)
         self.assertFalse(result["write_failed"])
+        sql = execute_many.call_args.args[0]
         rows = execute_many.call_args.args[1]
-        self.assertEqual(rows[0][8], "run-42")
+        self.assertEqual(len(rows[0]), 10)
+        self.assertEqual(sql.count("%s"), len(rows[0]))
+        self.assertEqual(rows[0][6:8], (observed_at, observed_at))
+        self.assertEqual(rows[0][8], 0.8)
+        self.assertEqual(rows[0][9], "run-42")
 
     def test_observe_candidates_reports_write_failure_without_raising(self):
         with (

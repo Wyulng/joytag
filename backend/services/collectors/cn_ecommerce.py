@@ -75,9 +75,9 @@ SEED_CATEGORY_MAP: dict[str, str | None] = {
 }
 
 MAX_WORDS_PER_COLLECTION = 200
-CN_SEED_QUERY_BUDGET = 80
-CN_DYNAMIC_SEED_QUOTA = 64
-CN_FIXED_SEED_QUOTA = 16
+CN_SEED_QUERY_BUDGET = 100
+CN_DYNAMIC_SEED_QUOTA = 80
+CN_FIXED_SEED_QUOTA = 20
 CN_DYNAMIC_MIN_HEAT = 0.45
 CN_MAX_SEED_DEPTH = 2
 CN_MAX_FRONTIER = 2000
@@ -378,7 +378,7 @@ def get_cn_trending_words(
 ) -> list[tuple[str, float, str | None]]:
     """获取中文建议词：动态种子优先、固定种子轮换、响应热度排序。"""
     global _LAST_COLLECTION_STATS
-    # 选择器本身负责 64/16 配额，这里再次硬截断，防止后续适配器或测试替换
+    # 选择器本身负责 80/20 配额，这里再次硬截断，防止后续适配器或测试替换
     # 选择器时突破单轮外部请求上限。
     seed_records = _select_seed_records()[:CN_SEED_QUERY_BUDGET]
     if not seed_records:

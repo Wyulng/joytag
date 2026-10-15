@@ -20,7 +20,7 @@ class FixedSchedulerTests(unittest.TestCase):
 
         self.assertEqual(cn_trigger.timezone, ZoneInfo("Asia/Shanghai"))
         self.assertEqual(retention_trigger.timezone, task_scheduler.UTC)
-        self.assertEqual(task_scheduler.OVERSEAS_CRON, "0 4,16 * * *")
+        self.assertEqual(task_scheduler.OVERSEAS_CRON, "0 4,12,20 * * *")
 
     def test_init_registers_five_idempotent_jobs(self):
         fake_scheduler = MagicMock()
@@ -76,7 +76,7 @@ class FixedSchedulerTests(unittest.TestCase):
             [(job["id"], job["cron"]) for job in status["jobs"]],
             [
                 (task_scheduler.CN_JOB_ID, "0 2 * * *"),
-                (task_scheduler.OVERSEAS_JOB_ID, "0 4,16 * * *"),
+                (task_scheduler.OVERSEAS_JOB_ID, "0 4,12,20 * * *"),
             ],
         )
 
