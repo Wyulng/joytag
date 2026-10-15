@@ -137,14 +137,23 @@ def ensure_schema() -> None:
         word_sha256 TEXT,
         response    TEXT,
         result      JSONB,
+        input_tokens  BIGINT NOT NULL DEFAULT 0,
+        output_tokens BIGINT NOT NULL DEFAULT 0,
+        country     TEXT NOT NULL DEFAULT '',
+        category    TEXT NOT NULL DEFAULT '',
         latency_ms  INT,
         retry_count INT NOT NULL DEFAULT 0,
         error       TEXT,
         expires_at  TIMESTAMPTZ NOT NULL DEFAULT now() + interval '{DEFAULT_RETENTION_DAYS["llm_trace"]} days'
     );
+    ALTER TABLE llm_trace ADD COLUMN IF NOT EXISTS input_tokens BIGINT NOT NULL DEFAULT 0;
+    ALTER TABLE llm_trace ADD COLUMN IF NOT EXISTS output_tokens BIGINT NOT NULL DEFAULT 0;
+    ALTER TABLE llm_trace ADD COLUMN IF NOT EXISTS country TEXT NOT NULL DEFAULT '';
+    ALTER TABLE llm_trace ADD COLUMN IF NOT EXISTS category TEXT NOT NULL DEFAULT '';
     CREATE INDEX IF NOT EXISTS idx_llm_trace_expires ON llm_trace (expires_at);
     CREATE INDEX IF NOT EXISTS idx_llm_trace_hash    ON llm_trace (prompt_hash);
     CREATE INDEX IF NOT EXISTS idx_llm_trace_word    ON llm_trace (word_sha256);
+    CREATE INDEX IF NOT EXISTS idx_llm_trace_cost_context ON llm_trace (ts, country, category);
 
     CREATE TABLE IF NOT EXISTS lineage_event (
         id            BIGSERIAL PRIMARY KEY,
@@ -212,9 +221,12 @@ def ensure_schema() -> None:
         next_eligible_at      TIMESTAMPTZ,
         decision_status       TEXT,
         source_heat_score     DOUBLE PRECISION NOT NULL DEFAULT 0,
+        seed_support_count    INT NOT NULL DEFAULT 1,
         last_collection_run_id TEXT NOT NULL DEFAULT '',
         PRIMARY KEY (pipeline, country, normalized_word)
     );
+    ALTER TABLE collector_candidate_observation
+        ADD COLUMN IF NOT EXISTS seed_support_count INT NOT NULL DEFAULT 1;
     CREATE INDEX IF NOT EXISTS idx_collector_observation_due
         ON collector_candidate_observation (pipeline, country, next_eligible_at);
     CREATE INDEX IF NOT EXISTS idx_collector_observation_seen

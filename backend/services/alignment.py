@@ -100,6 +100,8 @@ async def process_overseas_word(word: str, country: str, anchor_cn_id: str = Non
             "status": existing_decision.get("status"),
             "reason": payload.get("reason") or payload.get("assessment_reason") or "已有决策记录",
             "anchor_cn_word": payload.get("anchor_cn_word") or payload.get("cn_word"),
+            "anchor_match": bool(payload.get("anchor_cn_word") or payload.get("cn_word")),
+            "assessed_by": payload.get("assessed_by"),
             "cache_hit": True,
             "decision_collection": existing_decision.get("collection"),
         }
@@ -167,6 +169,8 @@ async def process_overseas_word(word: str, country: str, anchor_cn_id: str = Non
                 "reason": rule_reason,
                 "rule_id": rule_id,
                 "anchor_cn_word": None,
+                "anchor_match": False,
+                "assessed_by": "rule",
             }
 
         if rule_result is True:
@@ -206,6 +210,8 @@ async def process_overseas_word(word: str, country: str, anchor_cn_id: str = Non
             "status": "存疑",
             "reason": pending_reason,
             "anchor_cn_word": None,
+            "anchor_match": False,
+            "assessed_by": assessed_by,
         }
 
     rule_result, rule_reason, rule_id = check_word_against_rules(
@@ -251,7 +257,9 @@ async def process_overseas_word(word: str, country: str, anchor_cn_id: str = Non
             "id": tag_id,
             "status": status,
             "reason": reason,
-            "anchor_cn_word": resolved_cn_word
+            "anchor_cn_word": resolved_cn_word,
+            "anchor_match": True,
+            "assessed_by": assessed_by,
         }
 
     elif status == "存疑":
@@ -276,7 +284,9 @@ async def process_overseas_word(word: str, country: str, anchor_cn_id: str = Non
             "pending_id": pending_id,
             "status": status,
             "reason": reason,
-            "anchor_cn_word": resolved_cn_word
+            "anchor_cn_word": resolved_cn_word,
+            "anchor_match": True,
+            "assessed_by": assessed_by,
         }
 
     else:  # "需拦截" —— 持久化决策留痕（UCPD/GDPR 举证，不再丢弃）
@@ -303,5 +313,7 @@ async def process_overseas_word(word: str, country: str, anchor_cn_id: str = Non
             "status": status,
             "reason": reason,
             "rule_id": rule_id,
-            "anchor_cn_word": resolved_cn_word
+            "anchor_cn_word": resolved_cn_word,
+            "anchor_match": True,
+            "assessed_by": assessed_by,
         }

@@ -31,7 +31,7 @@ def _report(
         "blocked_decisions": 11,
     }
     return {
-        "schema_version": "1.0",
+        "schema_version": sync.REPORT_SCHEMA_VERSION,
         "report_date": report_date or now.date().isoformat(),
         "timezone": "Asia/Shanghai",
         "generated_at": generated.isoformat(),

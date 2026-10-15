@@ -1,4 +1,5 @@
 import unittest
+from collections import Counter
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -114,12 +115,64 @@ class ChineseSourceTests(unittest.TestCase):
             }
             for index in range(40)
         ]
-        with patch.object(cn_ecommerce, "_ensure_seed_frontier", return_value=frontier):
-            selected = cn_ecommerce._select_seed_records()
+        lanes = cn_ecommerce._select_seed_lanes(100, frontier=frontier)
 
+        self.assertEqual(len(lanes["high_quality"]), 50)
+        self.assertEqual(len(lanes["fixed"]), 25)
+        self.assertEqual(len(lanes["depth2"]), 0)
+        self.assertEqual(len(lanes["exploration"]), 25)
+        selected = [item for lane in lanes.values() for item in lane]
         self.assertEqual(len(selected), 100)
-        self.assertEqual(sum(item["seed_kind"] != "fixed" for item in selected), 80)
-        self.assertEqual(sum(item["seed_kind"] == "fixed" for item in selected), 20)
+        self.assertEqual(sum(item["seed_kind"] != "fixed" for item in selected), 75)
+        self.assertEqual(sum(item["seed_kind"] == "fixed" for item in selected), 25)
+
+    def test_depth_two_seeds_never_exceed_ten_percent_of_budget(self):
+        now = datetime.now(timezone.utc)
+        frontier = [
+            {
+                "seed_word": f"一级动态{index}",
+                "normalized_seed": f"一级动态{index}",
+                "seed_kind": "suggestion",
+                "seed_depth": 1,
+                "category": "服装" if index % 2 else "鞋类",
+                "source_heat_score": 0.9,
+                "last_seen_at": now,
+            }
+            for index in range(80)
+        ] + [
+            {
+                "seed_word": f"二级动态{index}",
+                "normalized_seed": f"二级动态{index}",
+                "seed_kind": "suggestion",
+                "seed_depth": 2,
+                "category": "服装" if index % 2 else "鞋类",
+                "source_heat_score": 0.9,
+                "last_seen_at": now,
+            }
+            for index in range(80)
+        ]
+
+        lanes = cn_ecommerce._select_seed_lanes(100, frontier=frontier)
+
+        selected = [item for lane in lanes.values() for item in lane]
+        self.assertLessEqual(
+            sum(int(item.get("seed_depth") or 0) >= 2 for item in selected),
+            10,
+        )
+
+    def test_exploration_prefers_lower_coverage_categories(self):
+        records = [
+            {"seed_word": "服装种子", "normalized_seed": "服装种子", "category": "服装"},
+            {"seed_word": "鞋类种子", "normalized_seed": "鞋类种子", "category": "鞋类"},
+        ]
+
+        selected = cn_ecommerce._select_undercovered(
+            records,
+            1,
+            Counter({"服装": 10, "鞋类": 1}),
+        )
+
+        self.assertEqual(selected[0]["category"], "鞋类")
 
     def test_dynamic_seed_is_not_due_during_cooldown(self):
         future = datetime.now(timezone.utc) + timedelta(days=1)
@@ -150,7 +203,9 @@ class ChineseCandidateSelectionTests(unittest.TestCase):
             "error_type": None,
         }
         with (
-            patch.object(cn_ecommerce, "_select_seed_records", return_value=[seed]),
+            patch.object(cn_ecommerce, "_select_seed_lanes", return_value={
+                "high_quality": [seed], "fixed": [], "depth2": [], "exploration": []
+            }),
             patch.object(cn_ecommerce, "_fetch_one_seed", return_value=(items, "request", True)),
             patch.object(cn_ecommerce.collector_state, "mark_seed_queried"),
             patch.object(cn_ecommerce.collector_state, "get_candidate_observations", return_value={}),
@@ -178,12 +233,17 @@ class ChineseCandidateSelectionTests(unittest.TestCase):
         self.assertEqual(stats["eligible_before_qdrant"], 3)
         self.assertEqual(stats["qdrant_existing_filtered"], 1)
         self.assertEqual(stats["selected_candidates"], 2)
+        self.assertEqual(stats["source_metrics"]["taobao_suggest"]["qdrant_existing"], 1)
+        self.assertEqual(stats["source_metrics"]["taobao_suggest"]["selected_candidates"], 2)
+        self.assertEqual(stats["source_metrics"]["taobao_suggest"]["success_rate"], 1.0)
 
     def test_cached_snapshot_missing_observations_is_backfilled_without_new_seed(self):
         seed = self._seed()
         items = [{"word": "快照新词", "rank": 0, "raw_heat": 3}]
         with (
-            patch.object(cn_ecommerce, "_select_seed_records", return_value=[seed]),
+            patch.object(cn_ecommerce, "_select_seed_lanes", return_value={
+                "high_quality": [seed], "fixed": [], "depth2": [], "exploration": []
+            }),
             patch.object(cn_ecommerce, "_fetch_one_seed", return_value=(items, "cache", False)),
             patch.object(cn_ecommerce.collector_state, "get_candidate_observations", return_value={}),
             patch.object(
@@ -210,7 +270,9 @@ class ChineseCandidateSelectionTests(unittest.TestCase):
             "next_eligible_at": None,
         }
         with (
-            patch.object(cn_ecommerce, "_select_seed_records", return_value=[seed]),
+            patch.object(cn_ecommerce, "_select_seed_lanes", return_value={
+                "high_quality": [seed], "fixed": [], "depth2": [], "exploration": []
+            }),
             patch.object(cn_ecommerce, "_fetch_one_seed", return_value=(items, "cache", False)),
             patch.object(
                 cn_ecommerce.collector_state,
@@ -238,7 +300,9 @@ class ChineseCandidateSelectionTests(unittest.TestCase):
         ]
         after = before[:cn_ecommerce.CN_MAX_FRONTIER]
         with (
-            patch.object(cn_ecommerce, "_select_seed_records", return_value=[seed]),
+            patch.object(cn_ecommerce, "_select_seed_lanes", return_value={
+                "high_quality": [seed], "fixed": [], "depth2": [], "exploration": []
+            }),
             patch.object(cn_ecommerce, "_fetch_one_seed", return_value=([], "cache", False)),
             patch.object(cn_ecommerce.collector_state, "list_seed_frontier", side_effect=[before, after]),
             patch.object(cn_ecommerce.collector_state, "trim_seed_frontier") as trim,
@@ -323,11 +387,12 @@ class CollectorStateTests(unittest.TestCase):
         self.assertFalse(result["write_failed"])
         sql = execute_many.call_args.args[0]
         rows = execute_many.call_args.args[1]
-        self.assertEqual(len(rows[0]), 10)
+        self.assertEqual(len(rows[0]), 11)
         self.assertEqual(sql.count("%s"), len(rows[0]))
         self.assertEqual(rows[0][6:8], (observed_at, observed_at))
         self.assertEqual(rows[0][8], 0.8)
         self.assertEqual(rows[0][9], "run-42")
+        self.assertEqual(rows[0][10], 1)
 
     def test_observe_candidates_reports_write_failure_without_raising(self):
         with (

@@ -32,7 +32,7 @@ TENANT_TOKEN_PATH = "/open-apis/auth/v3/tenant_access_token/internal"
 BLOCKS_PATH = "/open-apis/docx/v1/documents/{document_id}/blocks"
 BATCH_UPDATE_PATH = "/open-apis/docx/v1/documents/{document_id}/blocks/batch_update"
 
-REPORT_SCHEMA_VERSION = "1.0"
+REPORT_SCHEMA_VERSION = "1.1"
 REPORT_TIMEZONE_NAME = "Asia/Shanghai"
 REPORT_TIMEZONE = ZoneInfo(REPORT_TIMEZONE_NAME)
 MAX_REPORT_AGE = timedelta(hours=26)

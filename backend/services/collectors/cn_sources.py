@@ -17,16 +17,30 @@ class ChineseSourceAdapter(Protocol):
     def fetch(self, term: str, category: str | None = None) -> list[dict] | None:
         """返回候选列表；None 表示来源请求/解析失败。"""
 
+    def fetch_with_status(self, term: str, category: str | None = None) -> "SourceFetchResult":
+        """返回统一响应记录，以区分缓存、外发请求和失败状态。"""
+
+
+@dataclass(frozen=True)
+class SourceFetchResult:
+    candidates: list[dict] | None
+    outbound: bool
+    status_code: int | None = None
+    retry_after_seconds: int | None = None
+
 
 @dataclass(frozen=True)
 class TaobaoSuggestAdapter:
     name: str = "taobao_suggest"
 
     def fetch(self, term: str, category: str | None = None) -> list[dict] | None:
-        # 延迟导入，避免 cn_ecommerce 与适配器接口形成循环导入。
-        from services.collectors.cn_ecommerce import _fetch_taobao_suggest
+        return self.fetch_with_status(term, category).candidates
 
-        return _fetch_taobao_suggest(term, category)
+    def fetch_with_status(self, term: str, category: str | None = None) -> SourceFetchResult:
+        # 延迟导入，避免 cn_ecommerce 与适配器接口形成循环导入。
+        from services.collectors.cn_ecommerce import _fetch_taobao_suggest_result
+
+        return _fetch_taobao_suggest_result(term, category)
 
 
 @dataclass(frozen=True)
@@ -59,6 +73,30 @@ class AlibabaKeywordRecommendAdapter:
         raise RuntimeError(
             f"{self.api_name} requires signed authorized access and is shadow-only"
         )
+
+    def fetch_with_status(self, term: str, category: str | None = None) -> SourceFetchResult:
+        return SourceFetchResult(candidates=self.fetch(term, category), outbound=False)
+
+
+SOURCE_REGISTRY = {
+    "taobao_suggest": {"production_eligible": True, "requires_authorization": False},
+    # Official documentation requires authorization and product-line context.
+    "alibaba_keyword_recommend": {"production_eligible": False, "requires_authorization": True},
+}
+
+
+def parse_source_list(value: str | None, *, fallback: str = "taobao_suggest") -> tuple[str, ...]:
+    names = [part.strip().lower() for part in (value or "").split(",") if part.strip()]
+    if not names:
+        names = [fallback]
+    return tuple(dict.fromkeys(name for name in names if name in SOURCE_REGISTRY))
+
+
+def production_sources(value: str | None) -> tuple[str, ...]:
+    configured = parse_source_list(value)
+    eligible = tuple(name for name in configured if SOURCE_REGISTRY[name]["production_eligible"])
+    # Keep a validated baseline if the configured list contains only unapproved sources.
+    return eligible or ("taobao_suggest",)
 
 
 def get_cn_source_adapter(mode: str = "taobao_suggest") -> ChineseSourceAdapter:
