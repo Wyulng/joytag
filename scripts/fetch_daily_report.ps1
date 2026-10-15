@@ -104,7 +104,7 @@ catch {
     throw "The remote latest.json is not valid JSON."
 }
 
-if ($report.schema_version -ne "1.0") {
+if ($report.schema_version -ne "1.1") {
     throw "Unsupported daily report schema version."
 }
 if (@("success", "degraded") -notcontains [string]$report.status) {

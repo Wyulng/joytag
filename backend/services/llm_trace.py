@@ -19,7 +19,9 @@ logger = logging.getLogger(__name__)
 def record_trace(*, call_type: str, provider: str, model: str, request_id: str,
                  prompt_hash: str, prompt_pii: dict, response: str | None = None,
                  result: dict | None = None, latency_ms: int = 0, retry_count: int = 0,
-                 error: str | None = None, word: str | None = None) -> int | None:
+                 error: str | None = None, word: str | None = None,
+                 usage: dict | None = None, country: str | None = None,
+                 category: str | None = None) -> int | None:
     """记录一次 LLM 调用。word 参数会计算 word_sha256 供 DSAR 检索。"""
     if not is_db_available():
         logger.warning(f"[llm_trace] 数据库不可用，跳过留痕: {call_type}")
@@ -30,8 +32,9 @@ def record_trace(*, call_type: str, provider: str, model: str, request_id: str,
             row = conn.execute(
                 """INSERT INTO llm_trace
                    (call_type, provider, model, request_id, prompt_hash, prompt_pii,
-                    word_sha256, response, result, latency_ms, retry_count, error)
-                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    word_sha256, response, result, input_tokens, output_tokens,
+                    country, category, latency_ms, retry_count, error)
+                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                    RETURNING id""",
                 (
                     call_type,
@@ -43,6 +46,10 @@ def record_trace(*, call_type: str, provider: str, model: str, request_id: str,
                     hashlib.sha256(word.encode("utf-8")).hexdigest() if word else None,
                     response,
                     json.dumps(result, ensure_ascii=False) if result is not None else None,
+                    _usage_count(usage, "input"),
+                    _usage_count(usage, "output"),
+                    country or "",
+                    category or "",
                     latency_ms,
                     retry_count,
                     error,
@@ -52,6 +59,22 @@ def record_trace(*, call_type: str, provider: str, model: str, request_id: str,
     except Exception as e:
         logger.warning(f"[llm_trace] 留痕失败（best-effort）: {e}")
         return None
+
+
+def _usage_count(usage: dict | None, kind: str) -> int:
+    if not isinstance(usage, dict):
+        return 0
+    keys = ("prompt_tokens", "input_tokens", "inputTokens") if kind == "input" else (
+        "completion_tokens", "output_tokens", "outputTokens"
+    )
+    for key in keys:
+        if key not in usage or usage.get(key) is None:
+            continue
+        try:
+            return max(0, int(usage.get(key) or 0))
+        except (TypeError, ValueError):
+            continue
+    return 0
 
 
 def find_by_word(word: str, limit: int = 100) -> list[dict]:

@@ -1,6 +1,6 @@
 """动态采集种子构建（2026-08）：中文锚点 → 本地语种子。
 
-用 cn_anchors 最新 50 个锚点经 LLM 翻译为六国本地语言，作为 Amazon/eBay
+用类目均衡轮换的全量 cn_anchors 中 50 个锚点（优先最新锚点）经 LLM 翻译为六国本地语言，作为 Amazon/eBay
 搜索建议 API 的查询种子（海外词天然与中文锚点对齐，锚点检索命中率更高）。
 翻译结果持久化到 backend/data/translation_cache.json，逐轮增量翻译
 （缓存命中的词-国家对不再调 LLM）。LLM 全挂时返回空 dict，由调用方
@@ -25,8 +25,11 @@ logger = logging.getLogger(__name__)
 BASE_DIR = Path(__file__).parent.parent.parent  # backend/
 _CACHE_FILE = BASE_DIR / "data" / "translation_cache.json"
 _CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
-_MAX_CACHE_KEYS = 2000   # 缓存上限（超限截最旧）
+_MAX_CACHE_KEYS = 20000  # 覆盖扩容后的锚点轮换，避免反复付费翻译旧锚点
 _RECENT_ANCHOR_LIMIT = 50
+_ROTATING_ANCHOR_LIMIT = 50
+_ANCHOR_FRESH_SHARE = 0.20
+_ANCHOR_ROTATION_INTERVAL_SECONDS = 8 * 60 * 60
 _cache_lock = threading.Lock()   # 缓存读改写互斥（并发采集轮次见 app.py 端点 + cron）
 
 
@@ -107,6 +110,91 @@ def get_recent_anchor_words(limit: int = _RECENT_ANCHOR_LIMIT) -> list[tuple[str
     return [(word, category) for word, category, _ in recent]
 
 
+def get_rotating_anchor_words(
+    limit: int = _ROTATING_ANCHOR_LIMIT,
+    *,
+    now: datetime | None = None,
+) -> list[tuple[str, str | None]]:
+    """Select fresh anchors plus a category-balanced rotating window of all anchors."""
+    if limit <= 0:
+        return []
+
+    def sort_timestamp(value: str) -> float:
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            return parsed.timestamp()
+        except (AttributeError, TypeError, ValueError, OverflowError):
+            return float("-inf")
+
+    records: list[tuple[str, str | None, str, float]] = []
+    seen: set[str] = set()
+    for record in _iter_scroll(
+        ANCHOR_COLLECTION,
+        payload_keys=["cn_word", "category", "created_at", "first_seen_at"],
+    ):
+        payload = record.payload or {}
+        word = payload.get("cn_word")
+        if not isinstance(word, str) or not word.strip():
+            continue
+        normalized = word.strip().casefold()
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        category = payload.get("category") if isinstance(payload.get("category"), str) else None
+        first_seen = payload.get("first_seen_at") or payload.get("created_at") or ""
+        records.append((word.strip(), category, first_seen, sort_timestamp(first_seen)))
+    if not records:
+        return []
+
+    grouped: dict[str, list[tuple[str, str | None, str, float]]] = {}
+    for item in records:
+        grouped.setdefault(item[1] or "未分类", []).append(item)
+    for items in grouped.values():
+        items.sort(key=lambda item: (-item[3], item[0].casefold()))
+
+    def interleave(groups: dict[str, list[tuple[str, str | None, str, float]]]):
+        positions = {category: 0 for category in groups}
+        output = []
+        while True:
+            available = [
+                category for category, items in groups.items()
+                if positions[category] < len(items)
+            ]
+            if not available:
+                break
+            available.sort(key=lambda category: (positions[category], category))
+            for category in available:
+                output.append(groups[category][positions[category]])
+                positions[category] += 1
+        return output
+
+    ordered = interleave(grouped)
+    fresh_count = min(len(ordered), max(1, int(limit * _ANCHOR_FRESH_SHARE)))
+    # Keep genuinely newest anchors in the fresh share; category interleaving
+    # applies to the rotating remainder so a small category cannot hide a new
+    # anchor behind an older category head.
+    fresh = sorted(records, key=lambda item: (-item[3], item[0].casefold()))[:fresh_count]
+    fresh_keys = {item[0].casefold() for item in fresh}
+    remaining = [item for item in records if item[0].casefold() not in fresh_keys]
+    remaining_groups: dict[str, list[tuple[str, str | None, str, float]]] = {}
+    for item in remaining:
+        remaining_groups.setdefault(item[1] or "未分类", []).append(item)
+    for items in remaining_groups.values():
+        items.sort(key=lambda item: (-item[3], item[0].casefold()))
+    rotating = interleave(remaining_groups)
+    rotate_count = min(max(0, limit - len(fresh)), len(rotating))
+    if rotate_count:
+        moment = now or datetime.now(timezone.utc)
+        if moment.tzinfo is None:
+            moment = moment.replace(tzinfo=timezone.utc)
+        slot = int(moment.timestamp() // _ANCHOR_ROTATION_INTERVAL_SECONDS)
+        offset = (slot * rotate_count) % len(rotating)
+        rotating = rotating[offset:] + rotating[:offset]
+    return [(word, category) for word, category, _first_seen, _stamp in [*fresh, *rotating[:rotate_count]]]
+
+
 async def iter_country_seeds(countries: list[str] | None = None):
     """逐国产出 (country, [(本地语种子, 中文类目)])：某国翻译完成立即产出，不等待他国。
 
@@ -117,7 +205,7 @@ async def iter_country_seeds(countries: list[str] | None = None):
     """
     if countries is None:
         countries = EU_COUNTRIES
-    anchors = await asyncio.to_thread(get_recent_anchor_words)
+    anchors = await asyncio.to_thread(get_rotating_anchor_words)
     if not anchors:
         logger.warning("[seed_builder] cn_anchors 为空，返回空种子（调用方回退固定种子表）")
         return
@@ -132,7 +220,9 @@ async def iter_country_seeds(countries: list[str] | None = None):
             continue
         for i in range(0, len(missing), TRANSLATE_BATCH_SIZE):
             batch = missing[i:i + TRANSLATE_BATCH_SIZE]
-            results = await translate_chinese_to_foreign_batch(batch, lang)
+            results = await translate_chinese_to_foreign_batch(
+                batch, lang, country=country, category="seed_translation"
+            )
             for w, t in results.items():
                 translated[w][country] = t
         logger.info(f"[seed_builder] {country} 翻译完成: {len(missing)} 词待译，"

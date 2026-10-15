@@ -45,6 +45,38 @@ class DailyReportQdrantTests(unittest.TestCase):
 
 
 class DailyReportGenerationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_markdown_shows_zero_cost_when_pricing_is_set_but_category_has_no_calls(self):
+        report = {
+            "report_date": "2026-10-15",
+            "generated_at": "2026-10-15T09:00:00+08:00",
+            "timezone": "Asia/Shanghai",
+            "status": "ok",
+            "collections": {
+                "cn": {},
+                "overseas": {
+                    "last_auto_run": {
+                        "result": {
+                            "country_category_metrics": {
+                                "DE": {"shoes": {"candidates": 1}}
+                            }
+                        }
+                    }
+                },
+            },
+            "library": {},
+            "collector_state": {},
+            "llm": {
+                "pricing_configured": True,
+                "by_country_category": {},
+                "by_type": {},
+            },
+        }
+
+        markdown = daily_report._markdown(report)
+
+        self.assertIn("| DE | shoes | 1 | 0 | 0 | 0 | 0 | 0 | 0.000000 |", markdown)
+        self.assertNotIn("DE | shoes | 1 | 0 | 0 | 0 | 0 | 0 | 未配置单价", markdown)
+
     async def test_generation_writes_schema_and_degraded_warning(self):
         db_summary = {
             "auto_runs": {},
@@ -94,7 +126,7 @@ class DailyReportGenerationTests(unittest.IsolatedAsyncioTestCase):
                 datetime(2026, 8, 26, 9, 0, tzinfo=ZoneInfo("Asia/Shanghai"))
             )
 
-            self.assertEqual(report["schema_version"], "1.0")
+            self.assertEqual(report["schema_version"], "1.1")
             self.assertEqual(report["report_date"], "2026-08-26")
             self.assertEqual(report["status"], "degraded")
             self.assertIn("collector_candidate_observation_empty", report["warnings"])

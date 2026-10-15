@@ -6,7 +6,12 @@ import logging
 from pathlib import Path
 from datetime import datetime, timezone
 from services.alignment import process_cn_longtail_word
-from services.collectors.cn_ecommerce import get_cn_trending_words, get_last_collection_stats
+from services.collectors.cn_ecommerce import (
+    get_cn_trending_words,
+    get_last_collection_stats,
+    get_source_for_word,
+    get_support_for_word,
+)
 from services import collector_state
 from services.embedding import get_embeddings
 from services.qdrant_store import cn_anchors_exist
@@ -21,6 +26,18 @@ _RUN_LOCK = asyncio.Lock()
 # 进度文件路径（基于项目根目录）
 BASE_DIR = Path(__file__).parent.parent.parent
 _PROGRESS_FILE = BASE_DIR / "cn_collection_progress.json"
+
+
+def _with_source_insert_metrics(source_stats: dict, new_by_source: dict[str, int]) -> dict:
+    source_metrics = {
+        source: {**metrics, "new_anchors": int(new_by_source.get(source, 0))}
+        for source, metrics in (source_stats.get("source_metrics") or {}).items()
+    }
+    return {
+        **source_stats,
+        "source_metrics": source_metrics,
+        "new_anchors_by_source": dict(new_by_source),
+    }
 
 
 def _load_progress() -> dict:
@@ -86,6 +103,7 @@ async def _collect_cn_generator():
 
     duplicate_count = 0
     new_count = 0
+    new_anchors_by_source: dict[str, int] = {}
     save_counter = 0
 
     try:
@@ -133,6 +151,7 @@ async def _collect_cn_generator():
 
         if not new_words:
             logger.info("[cn] 本轮候选均已处理或在观察冷却期内，跳过向量化")
+            source_stats = _with_source_insert_metrics(get_last_collection_stats(), {})
             record_event(
                 run_id=run_id,
                 job_name="cn_collection",
@@ -141,7 +160,7 @@ async def _collect_cn_generator():
                     "total": total,
                     "skipped": True,
                     "duplicates": total,
-                    **get_last_collection_stats(),
+                    **source_stats,
                     "embedding_words": 0,
                     "assess_calls": 0,
                 },
@@ -153,7 +172,7 @@ async def _collect_cn_generator():
                 "duplicates": total,
                 "new": 0,
                 "message": "已全部采集完成（无新词），等待新词出现",
-                **get_last_collection_stats(),
+                **source_stats,
             }
             return
 
@@ -181,22 +200,25 @@ async def _collect_cn_generator():
                 duplicate_count += 1
             else:
                 # 新词，入库（带溯源元数据）
+                source_name = get_source_for_word(cn_word)
                 await process_cn_longtail_word(
                     cn_word,
                     category=seed_category,
                     provenance={
-                        "source_type": "taobao_suggest",
+                        "source_type": source_name,
                         "collection_run_id": run_id,
                         "collected_at": datetime.now(timezone.utc).isoformat(),
-                        "trend_score_source": "taobao_suggest_relative",
+                        "trend_score_source": f"{source_name}_relative",
                         "trend_score_is_absolute": False,
+                        **get_support_for_word(cn_word),
                     },
                     collection_run_id=run_id,
                     vector=vectors_by_key[key],
                     trend_score=heat,
-                    trend_score_source="taobao_suggest_relative",
+                    trend_score_source=f"{source_name}_relative",
                 )
                 new_count += 1
+                new_anchors_by_source[source_name] = new_anchors_by_source.get(source_name, 0) + 1
                 exists_by_key[key] = True
 
             collector_state.mark_candidate_processed(
@@ -237,7 +259,9 @@ async def _collect_cn_generator():
         "processed_words": history,
         "last_time": datetime.now(timezone.utc).isoformat()
     })
-    source_stats = get_last_collection_stats()
+    source_stats = _with_source_insert_metrics(
+        get_last_collection_stats(), new_anchors_by_source
+    )
     record_event(
         run_id=run_id,
         job_name="cn_collection",
@@ -284,6 +308,7 @@ async def run_cn_collector():
             "new": 0,
             "skipped": True,
             "message": final.get("message", "已全部采集完成"),
+            **get_last_collection_stats(),
         }
 
     return {
@@ -293,4 +318,5 @@ async def run_cn_collector():
         "duplicates": final.get("duplicates", 0),
         "new": final.get("new", 0),
         "skipped": False,
+        **{key: value for key, value in final.items() if key not in {"event", "run_id", "word", "message"}},
     }

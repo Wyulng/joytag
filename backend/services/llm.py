@@ -66,7 +66,8 @@ def _parse_json_fallback(raw: str) -> dict:
 def _record_trace(call_type: str, *, messages: list[dict], result: LLMResult | None = None,
                   error: str | None = None, latency_ms: int = 0, retry_count: int = 0,
                   prompt_pii: dict | None = None, word: str | None = None,
-                  parsed: dict | None = None) -> int | None:
+                  parsed: dict | None = None, country: str | None = None,
+                  category: str | None = None) -> int | None:
     """将 LLM 调用写入 llm_trace（假名化提示词哈希 + token→类型映射，不含原文值）。
     返回 trace 记录 ID（供词条 payload 关联决策留痕）；失败返回 None。"""
     try:
@@ -87,6 +88,9 @@ def _record_trace(call_type: str, *, messages: list[dict], result: LLMResult | N
             retry_count=retry_count,
             error=error,
             word=word,
+            usage=result.usage if result else None,
+            country=country,
+            category=category,
         )
     except Exception as e:
         logger.warning(f"[llm] 留痕失败（best-effort）: {e}")
@@ -108,6 +112,8 @@ async def _call_llm_with_retry(messages: list[dict], *, temperature: float,
                                max_retries: int = LLM_MAX_RETRIES,
                                call_type: str | None = None, word: str | None = None,
                                prompt_pii: dict | None = None,
+                               country: str | None = None,
+                               category: str | None = None,
                                trace_success: bool = True) -> LLMResult:
     provider = get_llm_provider()
     start = time.perf_counter()
@@ -123,7 +129,8 @@ async def _call_llm_with_retry(messages: list[dict], *, temperature: float,
             if call_type and trace_success:
                 _record_trace(call_type, messages=messages, result=result,
                               latency_ms=result.latency_ms, retry_count=attempt,
-                              prompt_pii=prompt_pii, word=word)
+                              prompt_pii=prompt_pii, word=word,
+                              country=country, category=category)
             return result
         except Exception as e:
             last_exception = e
@@ -134,7 +141,8 @@ async def _call_llm_with_retry(messages: list[dict], *, temperature: float,
     if call_type:
         _record_trace(call_type, messages=messages, error=str(last_exception),
                       latency_ms=int((time.perf_counter() - start) * 1000),
-                      retry_count=last_attempt, prompt_pii=prompt_pii, word=word)
+                      retry_count=last_attempt, prompt_pii=prompt_pii, word=word,
+                      country=country, category=category)
     if last_exception is None:  # pragma: no cover - range 至少执行一次，防御性保护
         raise RuntimeError("LLM 调用未执行")
     raise last_exception
@@ -172,6 +180,7 @@ async def assess_single(word: str, country: str, category: str | None = None) ->
     result = await _call_llm_with_retry(
         messages, temperature=0.1, max_tokens=ASSESS_MAX_TOKENS,
         max_retries=LLM_MAX_RETRIES, call_type="assess", word=word,
+        country=country, category=category,
         prompt_pii=pii_map, trace_success=False
     )
     content = result.content
@@ -188,13 +197,19 @@ async def assess_single(word: str, country: str, category: str | None = None) ->
     # 解析后统一留痕（含结构化结果，避免与重试包装器重复记录）
     trace_id = _record_trace("assess", messages=messages, result=result, latency_ms=result.latency_ms,
                              retry_count=result.retry_count, prompt_pii=pii_map,
-                             word=word, parsed=parsed)
+                             word=word, parsed=parsed, country=country, category=category)
     return assessment, reason, None, trace_id
 
 # ---------- 批量翻译中文锚点为本地语种子（用于海外采集动态种子，2026-08） ----------
 TRANSLATE_BATCH_SIZE = 12   # 单次批量翻译词数上限（seed_builder 分批共用，改此一处两处同步）
 
-async def translate_chinese_to_foreign_batch(words: list[str], language: str) -> dict[str, str]:
+async def translate_chinese_to_foreign_batch(
+    words: list[str],
+    language: str,
+    *,
+    country: str | None = None,
+    category: str | None = "seed_translation",
+) -> dict[str, str]:
     """
     将中文锚点词批量翻译为目标语言（电商搜索词场景，≤TRANSLATE_BATCH_SIZE 词/次）。
     返回 {原始中文词: 译文}；解析失败或个别词缺失时只返回成功项。
@@ -213,7 +228,8 @@ async def translate_chinese_to_foreign_batch(words: list[str], language: str) ->
         result = await _call_llm_with_retry(
             messages, temperature=0.1, max_tokens=TRANSLATE_MAX_TOKENS,
             max_retries=LLM_MAX_RETRIES, call_type="translate_seed",
-            word=",".join(clean_words), prompt_pii=pii_map
+            word=",".join(clean_words), prompt_pii=pii_map,
+            country=country, category=category,
         )
     except Exception as e:
         logger.warning(f"[llm] 批量翻译失败（{language}, {len(clean_words)} 词）: {e}")

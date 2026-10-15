@@ -16,6 +16,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import math
 import re
 import threading
 import unicodedata
@@ -77,6 +78,90 @@ def _json_value(value):
         except (TypeError, ValueError):
             return value
     return value
+
+
+def get_healthy_collection_run_streak(action: str, *, limit: int = 14) -> int:
+    """Count recent consecutive healthy scheduled collection runs from aggregate audit data.
+
+    Scaling stays at its conservative starting level when Postgres is unavailable,
+    when old run records do not contain the required metrics, or after any
+    unhealthy/failed run. No collection content is read for this decision.
+    """
+    limit = max(0, int(limit))
+    if not limit or not db.is_db_available():
+        return 0
+    try:
+        rows = db.fetchall(
+            "SELECT detail FROM audit_log WHERE action = %s ORDER BY ts DESC LIMIT %s",
+            (action, limit),
+        )
+    except Exception as exc:
+        _warn_db("collection health gate", exc)
+        return 0
+
+    streak = 0
+    for row in rows:
+        detail = _json_value(row[0] if isinstance(row, (tuple, list)) else row)
+        if not isinstance(detail, dict) or detail.get("status") != "success":
+            break
+        result = detail.get("result")
+        if not isinstance(result, dict):
+            break
+        if int(result.get("expansion_metrics_version") or 0) < 1:
+            break
+        try:
+            requests = int(result.get("source_requests") or 0)
+            errors = int(result.get("source_errors") or 0)
+            rate_limited = int(result.get("source_429") or 0)
+            observation_failures = int(result.get("candidate_observation_write_failed") or 0)
+            success_rate = float(result.get("source_success_rate"))
+            rate_limit_rate = float(result.get("source_429_rate"))
+        except (TypeError, ValueError, OverflowError):
+            break
+        if (
+            requests <= 0
+            or errors < 0
+            or errors > requests
+            or rate_limited < 0
+            or observation_failures != 0
+            or not math.isfinite(success_rate)
+            or not 0.0 <= success_rate <= 1.0
+            or not math.isfinite(rate_limit_rate)
+            or not 0.0 <= rate_limit_rate <= 1.0
+            or result.get("qdrant_existing_filter_failed")
+        ):
+            break
+        if success_rate < 0.95 or rate_limit_rate > 0.01 or errors / requests > 0.05:
+            break
+        streak += 1
+    if streak and action == "collect.cn.auto":
+        try:
+            latest_overseas = db.fetchone(
+                "SELECT detail FROM audit_log WHERE action = %s ORDER BY ts DESC LIMIT 1",
+                ("collect.overseas.auto",),
+            )
+        except Exception as exc:
+            _warn_db("overseas health gate", exc)
+            return 0
+        if latest_overseas:
+            detail = _json_value(latest_overseas[0])
+            overseas_result = detail.get("result") if isinstance(detail, dict) else None
+            try:
+                overseas_metrics_version = int((overseas_result or {}).get("expansion_metrics_version") or 0)
+                overseas_observation_failures = int(
+                    (overseas_result or {}).get("candidate_observation_write_failed") or 0
+                )
+            except (TypeError, ValueError, OverflowError):
+                return 0
+            if (
+                not isinstance(detail, dict)
+                or detail.get("status") != "success"
+                or not isinstance(overseas_result, dict)
+                or overseas_metrics_version < 1
+                or overseas_observation_failures != 0
+            ):
+                return 0
+    return streak
 
 
 def _warn_db(feature: str, exc: Exception) -> None:
@@ -222,7 +307,13 @@ def save_source_snapshot(
     return {**payload, "changed": changed}
 
 
-def record_source_error(source: str, country: str, seed: str) -> None:
+def record_source_error(
+    source: str,
+    country: str,
+    seed: str,
+    *,
+    retry_after_seconds: int | None = None,
+) -> None:
     """错误不覆盖有效响应，只缩短下一次重试间隔。"""
     if not db.is_db_available():
         return
@@ -231,6 +322,9 @@ def record_source_error(source: str, country: str, seed: str) -> None:
         return
     error_streak = int(previous.get("error_streak") or 0) + 1
     retry_hours = SOURCE_ERROR_RETRY_HOURS[min(error_streak - 1, len(SOURCE_ERROR_RETRY_HOURS) - 1)]
+    retry_delay = timedelta(hours=retry_hours)
+    if retry_after_seconds is not None:
+        retry_delay = max(retry_delay, timedelta(seconds=max(0, int(retry_after_seconds))))
     try:
         db.execute(
             """
@@ -240,7 +334,7 @@ def record_source_error(source: str, country: str, seed: str) -> None:
             """,
             (
                 error_streak,
-                utc_now() + timedelta(hours=retry_hours),
+                utc_now() + retry_delay,
                 source,
                 country or "",
                 key_sha256(seed),
@@ -265,7 +359,7 @@ def get_candidate_observations(
             SELECT normalized_word, display_word, source_set, category,
                    first_seen_at, last_seen_at, seen_count, last_processed_at,
                    next_eligible_at, decision_status, source_heat_score,
-                   last_collection_run_id
+                   last_collection_run_id, seed_support_count
             FROM collector_candidate_observation
             WHERE pipeline = %s AND country = %s AND normalized_word = ANY(%s)
             """,
@@ -292,6 +386,7 @@ def get_candidate_observations(
             "decision_status": row[9],
             "source_heat_score": float(row[10] or 0.0),
             "last_collection_run_id": row[11],
+            "seed_support_count": int(row[12] or 1),
         }
     return result
 
@@ -314,6 +409,10 @@ def observe_candidates(
         if not normalized:
             continue
         source_set = candidate.get("source_set") or [source]
+        try:
+            seed_support_count = max(1, int(candidate.get("seed_support_count") or 1))
+        except (TypeError, ValueError):
+            seed_support_count = 1
         rows.append((
             pipeline,
             country or "",
@@ -325,6 +424,7 @@ def observe_candidates(
             now,
             float(candidate.get("source_heat_score") or candidate.get("heat") or 0.0),
             run_id or "",
+            seed_support_count,
         ))
     if not rows:
         return {
@@ -353,8 +453,8 @@ def observe_candidates(
             INSERT INTO collector_candidate_observation
                 (pipeline, country, normalized_word, display_word, source_set,
                  category, first_seen_at, last_seen_at, seen_count,
-                 source_heat_score, last_collection_run_id)
-            VALUES (%s, %s, %s, %s, %s::jsonb, %s, %s, %s, 1, %s, %s)
+                 source_heat_score, last_collection_run_id, seed_support_count)
+            VALUES (%s, %s, %s, %s, %s::jsonb, %s, %s, %s, 1, %s, %s, %s)
             ON CONFLICT (pipeline, country, normalized_word) DO UPDATE SET
                 display_word = CASE
                     WHEN EXCLUDED.source_heat_score > collector_candidate_observation.source_heat_score
@@ -375,6 +475,10 @@ def observe_candidates(
                     EXCLUDED.source_heat_score
                 ),
                 last_collection_run_id = EXCLUDED.last_collection_run_id
+                , seed_support_count = GREATEST(
+                    collector_candidate_observation.seed_support_count,
+                    EXCLUDED.seed_support_count
+                )
             """,
             rows,
         )

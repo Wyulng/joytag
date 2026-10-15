@@ -6,7 +6,9 @@ import logging
 import hashlib
 from pathlib import Path
 from datetime import datetime, timezone
+from collections import defaultdict
 from services.alignment import process_overseas_word
+from services import collector_state
 from services.collectors.countries import EU_COUNTRIES
 from services.collectors import amazon_suggest, ebay_suggest, seed_builder
 from services.embedding import get_embeddings
@@ -15,12 +17,24 @@ from services.lineage import record_event, EVENT_START, EVENT_COMPLETE, EVENT_FA
 
 logger = logging.getLogger(__name__)
 
-MAX_TOTAL = 120
+MAX_TOTAL = 300
+OVERSEAS_PER_COUNTRY_CAPS = (20, 35, 50)
 _SOURCE_TIMEOUT = 280  # 单源整体超时（秒），超时降级空列表不拖垮整轮
 _SEED_TIMEOUT = 90     # 动态种子翻译整体超时（秒）：超时后剩余国家用固定种子，不再无限等 LLM
 _SAVE_INTERVAL = 10
 _MAX_HISTORY = 1000
 _RUN_LOCK = asyncio.Lock()
+
+
+def get_per_country_cap() -> tuple[int, int]:
+    """Raise the per-country merge cap only after healthy CN collection runs."""
+    healthy_streak = collector_state.get_healthy_collection_run_streak(
+        "collect.cn.auto", limit=14
+    )
+    cap = OVERSEAS_PER_COUNTRY_CAPS[2] if healthy_streak >= 14 else (
+        OVERSEAS_PER_COUNTRY_CAPS[1] if healthy_streak >= 7 else OVERSEAS_PER_COUNTRY_CAPS[0]
+    )
+    return cap, healthy_streak
 
 # 进度文件路径（基于项目根目录）
 BASE_DIR = Path(__file__).parent.parent.parent
@@ -45,12 +59,48 @@ def _save_progress(progress: dict):
         pass
 
 
+def _category_metrics_for(country_category_metrics: dict, country: str, category: str | None) -> dict:
+    category_key = category or "未分类"
+    country_metrics = country_category_metrics.setdefault(country, {})
+    return country_metrics.setdefault(category_key, {
+        "candidates": 0,
+        "anchor_matches": 0,
+        "reusable": 0,
+        "pending_review": 0,
+        "blocked": 0,
+        "llm_calls": 0,
+        "candidate_observation_write_failed": 0,
+    })
+
+
+def _record_decision_metric(
+    country_category_metrics: dict,
+    country: str,
+    category: str | None,
+    result: dict,
+    *,
+    count_llm: bool,
+) -> None:
+    metric = _category_metrics_for(country_category_metrics, country, category)
+    if result.get("anchor_match") or result.get("anchor_cn_word"):
+        metric["anchor_matches"] += 1
+    action = result.get("action")
+    if action == "approved":
+        metric["reusable"] += 1
+    elif action in {"pending", "pending_no_anchor"}:
+        metric["pending_review"] += 1
+    elif action in {"blocked", "rejected"}:
+        metric["blocked"] += 1
+    if count_llm and result.get("assessed_by") == "llm":
+        metric["llm_calls"] += 1
+
+
 def _merge_sources(
     amazon_words: list[dict],
     ebay_words: list[dict],
     countries: list[str],
     per_country: int = 20,
-    amazon_quota: int = 15,
+    amazon_quota: int | None = None,
 ) -> list[tuple]:
     """逐国合并双源候选：Amazon 先取 amazon_quota，eBay 跨源去重补到 per_country
     （Amazon 不足时 eBay 多补，仍不足时 Amazon 余量回补）。
@@ -58,6 +108,8 @@ def _merge_sources(
     （配额切片内同样去重，跨种子返回的大小写变体不双份入库）。"""
     amazon_by_country = {c: [w for w in amazon_words if w.get("country") == c] for c in countries}
     ebay_by_country = {c: [w for w in ebay_words if w.get("country") == c] for c in countries}
+    if amazon_quota is None:
+        amazon_quota = max(1, int(per_country * 0.75))
     merged: list[tuple] = []
     for c in countries:
         amz = amazon_by_country.get(c, [])
@@ -164,7 +216,7 @@ async def fetch_all_trends():
         amazon_words.extend(amz)
         ebay_words.extend(ebay)
 
-    per_country = MAX_TOTAL // len(countries) if countries else MAX_TOTAL
+    per_country, _healthy_streak = get_per_country_cap()
     return _merge_sources(amazon_words, ebay_words, countries, per_country=per_country)
 
 
@@ -192,10 +244,47 @@ async def _collect_overseas_generator():
     if not trends:
         record_event(run_id=run_id, job_name="overseas_collection", event_type=EVENT_COMPLETE,
                      run_facets={"total": 0, "skipped": True})
-        yield {"event": "done", "total": 0, "skipped": True, "duplicates": 0, "new": 0}
+        yield {
+            "event": "done", "total": 0, "skipped": True, "duplicates": 0, "new": 0,
+            "expansion_metrics_version": 1,
+            "per_country_cap": get_per_country_cap()[0],
+            "country_category_metrics": {},
+            "candidate_observation_write_failed": 0,
+            "candidate_observations_written": 0,
+        }
         return
 
     total = len(trends)
+
+    per_country_cap, healthy_run_streak = get_per_country_cap()
+    country_category_metrics: dict[str, dict] = {}
+    candidates_by_country: dict[str, list[dict]] = {}
+    for word, country, category, trend_score, source in trends:
+        _category_metrics_for(country_category_metrics, country, category)["candidates"] += 1
+        candidates_by_country.setdefault(country, []).append({
+            "word": word,
+            "category": category,
+            "source": source,
+            "source_heat_score": trend_score,
+            "source_set": [source] if source else ["overseas"],
+            "seed_support_count": 1,
+        })
+    candidate_observation_write_failed = 0
+    candidate_observations_written = 0
+    for country, country_candidates in candidates_by_country.items():
+        observed = collector_state.observe_candidates(
+            "overseas",
+            country,
+            country_candidates,
+            source="overseas",
+            run_id=run_id,
+        ) or {}
+        failed = int(observed.get("attempted") or 0) if observed.get("write_failed") else 0
+        candidate_observation_write_failed += failed
+        candidate_observations_written += int(observed.get("written") or 0)
+        if failed:
+            for item in country_candidates:
+                _category_metrics_for(country_category_metrics, country, item.get("category"))["candidate_observation_write_failed"] += 1
 
     # 检查哪些词是新词（不在进度文件中）
     unprocessed = [t for t in trends if f"{t[0]}:{t[1]}" not in processed_keys]
@@ -205,13 +294,27 @@ async def _collect_overseas_generator():
     if not unprocessed:
         logger.info(f"[overseas] 词库已有 {processed_count} 条，全部已处理，跳过")
         record_event(run_id=run_id, job_name="overseas_collection", event_type=EVENT_COMPLETE,
-                     run_facets={"total": total, "skipped": True})
+                     run_facets={
+                         "total": total,
+                         "skipped": True,
+                         "per_country_cap": per_country_cap,
+                         "healthy_run_streak": healthy_run_streak,
+                         "country_category_metrics": country_category_metrics,
+                         "candidate_observation_write_failed": candidate_observation_write_failed,
+                         "candidate_observations_written": candidate_observations_written,
+                     })
         yield {
             "event": "done",
             "total": total,
             "skipped": True,
             "duplicates": total,
             "new": 0,
+            "expansion_metrics_version": 1,
+            "per_country_cap": per_country_cap,
+            "healthy_run_streak": healthy_run_streak,
+            "country_category_metrics": country_category_metrics,
+            "candidate_observation_write_failed": candidate_observation_write_failed,
+            "candidate_observations_written": candidate_observations_written,
             "message": "已全部采集完成（无新词），等待新词出现"
         }
         return
@@ -274,6 +377,19 @@ async def _collect_overseas_generator():
                     cached_decision.get("action"),
                     hashlib.sha256(word.encode("utf-8")).hexdigest(),
                 )
+                cached_payload = cached_decision.get("payload") or {}
+                _record_decision_metric(
+                    country_category_metrics,
+                    country,
+                    category,
+                    {
+                        "action": cached_decision.get("action"),
+                        "anchor_cn_word": cached_payload.get("anchor_cn_word") or cached_payload.get("cn_word"),
+                        "anchor_match": bool(cached_payload.get("anchor_cn_word") or cached_payload.get("cn_word")),
+                        "assessed_by": cached_payload.get("assessed_by"),
+                    },
+                    count_llm=False,
+                )
             else:
                 result = await process_overseas_word(
                     word=word,
@@ -293,6 +409,13 @@ async def _collect_overseas_generator():
                     "status": result.get("status"),
                     "stored": result.get("stored", False),
                 }
+                _record_decision_metric(
+                    country_category_metrics,
+                    country,
+                    category,
+                    result,
+                    count_llm=True,
+                )
                 if action == "approved":
                     approved_count += 1
                     new_count += 1
@@ -337,6 +460,11 @@ async def _collect_overseas_generator():
                  run_facets={
                      "total": total, "approved": approved_count, "pending": pending_count,
                      "rejected": rejected_count, "duplicates": duplicate_count, "new": new_count,
+                     "per_country_cap": per_country_cap,
+                     "healthy_run_streak": healthy_run_streak,
+                     "country_category_metrics": country_category_metrics,
+                     "candidate_observation_write_failed": candidate_observation_write_failed,
+                     "candidate_observations_written": candidate_observations_written,
                  })
     yield {
         "event": "done",
@@ -348,6 +476,12 @@ async def _collect_overseas_generator():
         "duplicates": duplicate_count,
         "new": new_count,
         "run_id": run_id,
+        "expansion_metrics_version": 1,
+        "per_country_cap": per_country_cap,
+        "healthy_run_streak": healthy_run_streak,
+        "country_category_metrics": country_category_metrics,
+        "candidate_observation_write_failed": candidate_observation_write_failed,
+        "candidate_observations_written": candidate_observations_written,
     }
 
 
@@ -380,6 +514,12 @@ async def run_overseas_collector():
             "new": 0,
             "skipped": True,
             "message": final.get("message", "已全部采集完成"),
+        "expansion_metrics_version": final.get("expansion_metrics_version", 1),
+        "per_country_cap": final.get("per_country_cap", 20),
+        "healthy_run_streak": final.get("healthy_run_streak", 0),
+        "country_category_metrics": final.get("country_category_metrics", {}),
+        "candidate_observation_write_failed": final.get("candidate_observation_write_failed", 0),
+        "candidate_observations_written": final.get("candidate_observations_written", 0),
         }
 
     return {
@@ -390,4 +530,10 @@ async def run_overseas_collector():
         "duplicates": final.get("duplicates", 0),
         "new": final.get("new", 0),
         "skipped": False,
+        "expansion_metrics_version": final.get("expansion_metrics_version", 1),
+        "per_country_cap": final.get("per_country_cap", 20),
+        "healthy_run_streak": final.get("healthy_run_streak", 0),
+        "country_category_metrics": final.get("country_category_metrics", {}),
+        "candidate_observation_write_failed": final.get("candidate_observation_write_failed", 0),
+        "candidate_observations_written": final.get("candidate_observations_written", 0),
     }

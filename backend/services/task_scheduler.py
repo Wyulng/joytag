@@ -89,11 +89,35 @@ def _safe_result(result: Any) -> dict[str, Any]:
         "candidate_observation_error_type",
         "eligible_before_qdrant", "qdrant_existing_filtered", "selected_candidates",
         "active_dynamic_seeds", "frontier_trimmed", "qdrant_existing_filter_failed",
+        "source_429", "source_success_rate", "source_429_rate", "request_budget",
+        "healthy_run_streak", "cross_source_duplicates", "depth2_seeds",
+        "source_list", "source_metrics", "country_category_metrics",
+        "new_anchors_by_source",
+        "anchor_matches", "candidate_observations_written", "expansion_metrics_version",
     }
+
+    def safe_aggregate(value: Any, depth: int = 0) -> Any:
+        if depth > 3:
+            return None
+        if value is None or isinstance(value, (str, int, float, bool)):
+            return value
+        if isinstance(value, list):
+            return [safe_aggregate(item, depth + 1) for item in value if isinstance(item, (str, int, float, bool))]
+        if isinstance(value, dict):
+            return {
+                str(key): safe_aggregate(item, depth + 1)
+                for key, item in value.items()
+                if isinstance(item, (str, int, float, bool, dict, list))
+            }
+        return None
+
     return {
-        key: value
+        key: safe_aggregate(value)
         for key, value in result.items()
-        if key in allowed and isinstance(value, (str, int, float, bool))
+        if key in allowed
+        and (isinstance(value, (str, int, float, bool)) or key in {
+            "source_list", "source_metrics", "country_category_metrics", "new_anchors_by_source"
+        })
     }
 
 
